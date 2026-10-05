@@ -6,6 +6,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
+  Alert,
   App as AntdApp,
   Button,
   Card,
@@ -36,11 +37,14 @@ import { selectInstruments } from '@/stores/instrumentSlice';
 import {
   bulkSetVerdict,
   createCalibration,
+  dismissHoldThunk,
   patchFilter,
   removeCalibration,
   resetFilter,
+  retryHold,
   selectCalibrationFilter,
   selectCalibrations,
+  selectHolds,
   updateCalibration,
 } from '@/stores/calibrationSlice';
 import {
@@ -48,12 +52,12 @@ import {
   SELF_NOISE_LIMIT,
   SENSITIVITY_RANGE,
   createEmptyCalibrationFilter,
-  judgeCalibration,
   sensitivityDelta,
   type Calibration,
   type ResponseVerdict,
 } from '@/types/calibration';
 import { INSTRUMENT_TYPES, type InstrumentType } from '@/types/instrument';
+import { HOLD_KIND_LABEL, HOLD_SOURCE_LABEL, type Hold } from '@/types/hold';
 import { round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
 
@@ -73,7 +77,12 @@ interface CalibrationRow {
   row: Calibration;
   instrumentModel: string;
   instrumentType: string;
+  /** 标定所属序列号（序列号快照，不随后续换号改变） */
   serialNo: string;
+  /** 仪器档案当前序列号（可能与本次标定的序列号不同） */
+  currentSerialNo: string;
+  /** 本次标定序列号是否已不是档案当前序列号（旧序列号历史标定） */
+  serialSwitched: boolean;
   stationCode: string;
   arrayName: string;
   arrayId: string;
@@ -90,6 +99,7 @@ export default function CalibrationBoard() {
   const instruments = useAppSelector(selectInstruments);
   const stations = useAppSelector(selectStations);
   const arrays = useAppSelector(selectArrays);
+  const holds = useAppSelector(selectHolds);
   const filter = useAppSelector(selectCalibrationFilter);
 
   const [modalOpen, setModalOpen] = useState(false);
@@ -132,13 +142,14 @@ export default function CalibrationBoard() {
     return map;
   }, [arrays, instruments, stations]);
 
-  /** 逐仪器排序后的标定序列，用于计算灵敏度变化 */
+  /** 逐「仪器+序列号」排序后的标定序列，用于计算灵敏度变化（跨序列号不串） */
   const deltaIndex = useMemo(() => {
     const grouped = new Map<string, Calibration[]>();
     calibrations.forEach((row) => {
-      const list = grouped.get(row.instrumentId) ?? [];
+      const key = `${row.instrumentId}::${row.serialSnapshot}`;
+      const list = grouped.get(key) ?? [];
       list.push(row);
-      grouped.set(row.instrumentId, list);
+      grouped.set(key, list);
     });
     const result = new Map<string, ReturnType<typeof sensitivityDelta>>();
     grouped.forEach((list) => {
@@ -154,11 +165,15 @@ export default function CalibrationBoard() {
     return calibrations
       .map((row) => {
         const info = instrumentIndex.get(row.instrumentId);
+        const snapshotSerial = row.serialSnapshot || info?.serialNo || '—';
+        const currentSerial = info?.serialNo ?? '—';
         return {
           row,
           instrumentModel: info?.model ?? '仪器已删除',
           instrumentType: info?.type ?? '未知',
-          serialNo: info?.serialNo ?? '—',
+          serialNo: snapshotSerial,
+          currentSerialNo: currentSerial,
+          serialSwitched: currentSerial !== '—' && snapshotSerial !== currentSerial,
           stationCode: info?.stationCode ?? '—',
           arrayName: info?.arrayName ?? '—',
           arrayId: info?.arrayId ?? '',
@@ -203,16 +218,29 @@ export default function CalibrationBoard() {
     instrumentTypes: filter.instrumentTypes,
   };
 
+  /** 待确认挂起（计量站侧优先处理；同时展示运维班侧涉及标定的挂起） */
+  const openHolds = useMemo(
+    () =>
+      holds
+        .filter((hold) => hold.status === 'open')
+        .sort((a, b) => b.updatedAt - a.updatedAt),
+    [holds]
+  );
+
   const trendRows = useMemo(() => {
     const targetId = trendInstrumentId ?? rows[0]?.row.instrumentId ?? null;
-    if (!targetId) return { targetId: null as string | null, points: [] as Calibration[] };
+    if (!targetId) return { targetId: null as string | null, points: [] as Calibration[], serialNo: '' };
+    const target = instruments.find((item) => item.id === targetId);
+    // 趋势只画当前序列号自己的标定；旧序列号的历次标定不并入新序列号
+    const currentSerial = target?.serialNo ?? '';
     return {
       targetId,
+      serialNo: currentSerial,
       points: calibrations
-        .filter((row) => row.instrumentId === targetId)
+        .filter((row) => row.instrumentId === targetId && (!currentSerial || row.serialSnapshot === currentSerial))
         .sort((a, b) => a.date.localeCompare(b.date)),
     };
-  }, [calibrations, rows, trendInstrumentId]);
+  }, [calibrations, instruments, rows, trendInstrumentId]);
 
   const openCreate = () => {
     setEditingId(null);
@@ -231,7 +259,6 @@ export default function CalibrationBoard() {
     });
     setModalOpen(true);
   };
-
   const openEdit = (row: Calibration) => {
     setEditingId(row.id);
     form.setFieldsValue({
@@ -263,17 +290,55 @@ export default function CalibrationBoard() {
       };
       if (editingId) {
         await dispatch(updateCalibration({ id: editingId, patch: payload })).unwrap();
-        message.success('标定记录已更新，结论已按灵敏度与自噪重新核定');
+        message.success('标定记录已更新（仅改标定册，不直接回写仪器状态）');
       } else {
-        await dispatch(createCalibration(payload)).unwrap();
         const instrument = instruments.find((row) => row.id === payload.instrumentId);
-        const verdict = judgeCalibration(instrument?.type ?? '宽频带', payload.sensitivity, payload.selfNoise);
-        message.success(`标定记录已保存，自动初判为「${verdict}」`);
+        try {
+          const result = await dispatch(
+            createCalibration({
+              ...payload,
+              // 计量站打开表单时的序列号与 revision：保存时核对，两侧对不上先挂起
+              baseSerialNo: instrument?.serialNo ?? '',
+              baseRevision: instrument?.revision ?? 0,
+            })
+          ).unwrap();
+          if (result.outcome === 'blocked') {
+            message.warning('标定已存入标定册（归录入时序列号）；仪器状态因两侧对不上未改写，已挂起等确认');
+          } else {
+            const verdict = result.calibration.responseVerdict;
+            message.success(
+              result.firstForSerial
+                ? `这是序列号「${result.calibration.serialSnapshot}」的第一次标定，自动初判「${verdict}」，仪器已置为「${result.instrumentState}」`
+                : `标定记录已保存，自动初判为「${verdict}」，仪器状态为「${result.instrumentState}」`
+            );
+          }
+        } catch (error) {
+          message.error(typeof error === 'string' ? error : '标定保存失败，请重试标定记录');
+        }
       }
       setModalOpen(false);
     } finally {
       setSubmitting(false);
     }
+  };
+
+  /** 计量站重试自己的挂起：只按自己的标定记录重新核状态，不动运维班更换单 */
+  const handleRetryHold = async (hold: Hold) => {
+    try {
+      const result = await dispatch(retryHold(hold.id)).unwrap();
+      if (result.resolved) {
+        message.success(`序列号已对上，仪器状态已按本序列号标定置为「${result.state}」，挂起解除`);
+      } else {
+        message.warning('标定所属序列号与档案当前序列号仍不一致，维持挂起，请先与运维班核对更换单');
+      }
+    } catch (error) {
+      message.error(typeof error === 'string' ? error : '重试失败');
+    }
+  };
+
+  const handleDismissHold = async (hold: Hold) => {
+    await dispatch(dismissHoldThunk({ id: hold.id, resolution: '计量站确认暂不处理' })).unwrap();
+    message.success('挂起已标记为暂不处理');
   };
 
   const handleBulkVerdict = async (verdict: ResponseVerdict) => {
@@ -374,6 +439,48 @@ export default function CalibrationBoard() {
         <StatBadge label="标定人" value={totals.operatorCount} suffix="人" tone="default" />
       </div>
 
+      {openHolds.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          message={`有 ${openHolds.length} 条与运维班更换册对不上的记录，已挂起等确认（标定记录不丢、仪器状态不改写）`}
+          description={
+            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+              {openHolds.slice(0, 4).map((hold) => {
+                const instrument = instruments.find((item) => item.id === hold.instrumentId);
+                return (
+                  <div key={hold.id}>
+                    <Space size={8} wrap>
+                      <Tag color="orange">{HOLD_KIND_LABEL[hold.kind]}</Tag>
+                      <span>
+                        {HOLD_SOURCE_LABEL[hold.source]}发起 · {instrument?.model ?? '仪器已删除'}（
+                        <span className="gb-mono">{hold.expectedSerialNo}</span>
+                        {hold.actualSerialNo !== hold.expectedSerialNo ? (
+                          <>
+                            {' → 现 '}
+                            <span className="gb-mono">{hold.actualSerialNo}</span>
+                          </>
+                        ) : null}
+                        ）
+                      </span>
+                      {hold.source === 'calibration' ? (
+                        <Button size="small" type="primary" onClick={() => void handleRetryHold(hold)}>
+                          重试标定回写
+                        </Button>
+                      ) : null}
+                      <Button size="small" onClick={() => void handleDismissHold(hold)}>
+                        暂不处理
+                      </Button>
+                    </Space>
+                    <div className="gb-hint">{hold.detail}</div>
+                  </div>
+                );
+              })}
+            </Space>
+          }
+        />
+      ) : null}
+
       <FilterBar
         modelValue={filterModel}
         selects={[
@@ -428,13 +535,16 @@ export default function CalibrationBoard() {
           columns={[
             {
               title: '仪器',
-              width: 200,
+              width: 210,
               render: (_: unknown, item: CalibrationRow) => (
                 <div>
                   <div>
                     {item.instrumentModel} <Tag>{item.instrumentType}</Tag>
                   </div>
                   <div className="gb-hint gb-mono">{item.serialNo}</div>
+                  {item.serialSwitched ? (
+                    <div className="gb-danger gb-hint">旧序列号标定 · 现序列号 {item.currentSerialNo}</div>
+                  ) : null}
                 </div>
               ),
             },
@@ -575,8 +685,9 @@ export default function CalibrationBoard() {
               ))}
             </svg>
             <p className="gb-hint">
-              纵轴为灵敏度（V·s/m），横轴为标定日期；共 {trendChart.dots.length} 次标定。灵敏度变化超过 5%
-              会以红色提示，供判断仪器漂移趋势。
+              纵轴为灵敏度（V·s/m），横轴为标定日期；趋势只取当前序列号
+              {trendRows.serialNo ? `（${trendRows.serialNo}）` : ''}自己的 {trendChart.dots.length} 次标定，
+              旧序列号的历次标定不并入。灵敏度变化超过 5% 会以红色提示，供判断仪器漂移趋势。
             </p>
           </>
         )}

@@ -1,6 +1,11 @@
 /**
  * 仪器 slice：维护仪器列表、登记草稿与选中台站。
- * 序列号唯一性校验与「登记后自动生成下一次标定待办」在本 slice 的动作里完成。
+ * 序列号唯一性校验、登记后标定待办在此完成。
+ *
+ * 两册分治下的写入约束：
+ * - 序列号只能由运维班认下更换单时改（utils/ledger.ts），本 slice 的普通编辑不写序列号；
+ * - 仪器状态只由本序列号自己的标定驱动，普通编辑改状态同样走 revision 乐观锁；
+ * - revision 由台账协议统一递增，页面编辑保存必须带当前 revision，对不上则拒绝。
  */
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import { db, createId, watchTable } from '@/utils/db';
@@ -44,7 +49,7 @@ export async function findSerialConflict(
 export const createInstrument = createAsyncThunk(
   'instrument/createInstrument',
   async (
-    payload: Omit<Instrument, 'id' | 'createdAt' | 'updatedAt'>,
+    payload: Omit<Instrument, 'id' | 'createdAt' | 'updatedAt' | 'revision'>,
     { rejectWithValue }
   ) => {
     const conflict = await findSerialConflict(payload.serialNo);
@@ -52,7 +57,7 @@ export const createInstrument = createAsyncThunk(
       return rejectWithValue(`序列号「${payload.serialNo}」已被仪器 ${conflict.model} 占用`);
     }
     const now = Date.now();
-    const row: Instrument = { ...payload, id: createId('ins'), createdAt: now, updatedAt: now };
+    const row: Instrument = { ...payload, revision: 0, id: createId('ins'), createdAt: now, updatedAt: now };
     await db.instruments.put(row);
     // 登记后自动生成下一次标定待办：待标定状态 + 提示文案
     const dueInDays = daysUntilDue(null, row.installDate);
@@ -63,7 +68,7 @@ export const createInstrument = createAsyncThunk(
 export const updateInstrument = createAsyncThunk(
   'instrument/updateInstrument',
   async (
-    payload: { id: string; patch: Partial<Instrument> },
+    payload: { id: string; patch: Partial<Instrument>; baseRevision?: number },
     { rejectWithValue }
   ) => {
     if (payload.patch.serialNo) {
@@ -72,25 +77,47 @@ export const updateInstrument = createAsyncThunk(
         return rejectWithValue(`序列号「${payload.patch.serialNo}」已被占用`);
       }
     }
-    await db.instruments.update(payload.id, { ...payload.patch, updatedAt: Date.now() } as never);
+    // 乐观锁：档案已被另一侧（标定 / 更换）先保存过时，拒绝页面编辑覆盖
+    if (typeof payload.baseRevision === 'number') {
+      const current = await db.instruments.get(payload.id);
+      if (!current) return rejectWithValue('仪器档案不存在');
+      if (current.revision !== payload.baseRevision) {
+        return rejectWithValue(
+          `仪器档案刚被另一侧更新（revision ${payload.baseRevision} → ${current.revision}），请刷新后再保存`
+        );
+      }
+    }
+    const { revision: _ignored, ...restPatch } = payload.patch;
+    const current = await db.instruments.get(payload.id);
+    if (!current) return rejectWithValue('仪器档案不存在');
+    await db.instruments.update(payload.id, {
+      ...restPatch,
+      revision: current.revision + 1,
+      updatedAt: Date.now(),
+    } as never);
     return payload;
   }
 );
 
-/** 删除仪器：级联删除标定与更换记录 */
+/** 删除仪器：级联删除标定、更换与挂起记录 */
 export const removeInstrument = createAsyncThunk(
   'instrument/removeInstrument',
   async (instrumentId: string) => {
-    await db.transaction('rw', [db.instruments, db.calibrations, db.replaces], async () => {
-      await db.calibrations.where('instrumentId').equals(instrumentId).delete();
-      await db.replaces.where('instrumentId').equals(instrumentId).delete();
-      await db.instruments.delete(instrumentId);
-    });
+    await db.transaction(
+      'rw',
+      [db.instruments, db.calibrations, db.replaces, db.holds],
+      async () => {
+        await db.calibrations.where('instrumentId').equals(instrumentId).delete();
+        await db.replaces.where('instrumentId').equals(instrumentId).delete();
+        await db.holds.where('instrumentId').equals(instrumentId).delete();
+        await db.instruments.delete(instrumentId);
+      }
+    );
     return instrumentId;
   }
 );
 
-/** 批量改状态（如把超期仪器统一置为待标定） */
+/** 批量改状态（如把超期仪器统一置为待标定）；台账状态回写同样递增 revision */
 export const bulkSetInstrumentState = createAsyncThunk(
   'instrument/bulkSetInstrumentState',
   async (payload: { ids: string[]; state: InstrumentState }) => {
@@ -100,21 +127,9 @@ export const bulkSetInstrumentState = createAsyncThunk(
       .anyOf(payload.ids)
       .modify((row) => {
         row.state = payload.state;
+        row.revision += 1;
         row.updatedAt = now;
       });
-    return payload;
-  }
-);
-
-/** 更换完成后回写仪器序列号并置为在用 */
-export const applySerialReplace = createAsyncThunk(
-  'instrument/applySerialReplace',
-  async (payload: { instrumentId: string; newSerialNo: string }) => {
-    await db.instruments.update(payload.instrumentId, {
-      serialNo: payload.newSerialNo,
-      state: '在用',
-      updatedAt: Date.now(),
-    } as never);
     return payload;
   }
 );

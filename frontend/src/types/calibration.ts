@@ -6,8 +6,13 @@ export const RESPONSE_VERDICTS: ResponseVerdict[] = ['合格', '不合格', '待
 /** 标定：同一仪器可叠加多次标定记录 */
 export interface Calibration {
   id: string;
-  /** 被标定仪器 */
+  /** 被标定仪器（档案 id） */
   instrumentId: string;
+  /**
+   * 序列号快照：录入标定那一刻仪器挂的序列号。
+   * 旧序列号的历次标定仍归旧序列号；新序列号要等自己的第一次标定出来。
+   */
+  serialSnapshot: string;
   /** 标定日期 */
   date: string;
   /** 灵敏度（V·s/m） */

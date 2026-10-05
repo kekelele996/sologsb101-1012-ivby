@@ -17,12 +17,21 @@ export interface Replace {
   instrumentId: string;
   /** 更换原因 */
   reason: string;
+  /** 旧序列号（登记更换单时快照；旧序列号的历次标定仍归旧序列号） */
+  oldSerialNo: string;
   /** 新序列号（更换完成后回写仪器） */
   newSerialNo: string;
   /** 更换日期 */
   date: string;
   /** 状态 */
   state: ReplaceState;
+  /**
+   * 运维班认下时档案的 revision（乐观锁基准）。
+   * 推「已更换」时若档案 revision 已变（计量站先保存过），不覆盖、转挂起。
+   */
+  baseRevision: number;
+  /** 认下（流转到已更换）时间：认下后的更换单不可再改 */
+  committedAt: number | null;
   /** 责任人 */
   operator: string;
   /** 备注 */

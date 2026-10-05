@@ -120,6 +120,8 @@ export default function StationInstruments() {
   const [editingStationId, setEditingStationId] = useState<string | null>(null);
   const [instrumentModalOpen, setInstrumentModalOpen] = useState(false);
   const [editingInstrumentId, setEditingInstrumentId] = useState<string | null>(null);
+  /** 正在编辑的仪器档案（序列号锁定提示与 revision 乐观锁） */
+  const [editingInstrument, setEditingInstrument] = useState<Instrument | null>(null);
   const [activeStationId, setActiveStationId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [stationForm] = Form.useForm<StationFormValues>();
@@ -267,6 +269,7 @@ export default function StationInstruments() {
   const openInstrumentCreate = (station: SeisStation) => {
     setActiveStationId(station.id);
     setEditingInstrumentId(null);
+    setEditingInstrument(null);
     dispatch(resetDraft());
     const draft = { ...createEmptyInstrumentDraft(), stationId: station.id };
     dispatch(patchDraft(draft));
@@ -284,6 +287,7 @@ export default function StationInstruments() {
   const openInstrumentEdit = (station: SeisStation, instrument: Instrument) => {
     setActiveStationId(station.id);
     setEditingInstrumentId(instrument.id);
+    setEditingInstrument(instrument);
     instrumentForm.setFieldsValue({
       type: instrument.type,
       model: instrument.model,
@@ -313,8 +317,16 @@ export default function StationInstruments() {
         remark: values.remark?.trim() ?? '',
       };
       if (editingInstrumentId) {
-        await dispatch(updateInstrument({ id: editingInstrumentId, patch: payload })).unwrap();
-        message.success('仪器信息已更新');
+        // 序列号归运维班更换册：页面编辑不回写序列号，只改型号/安装/状态/备注
+        const { serialNo: _lockedSerial, ...editablePatch } = payload;
+        await dispatch(
+          updateInstrument({
+            id: editingInstrumentId,
+            patch: editablePatch,
+            baseRevision: editingInstrument?.revision,
+          })
+        ).unwrap();
+        message.success('仪器信息已更新（序列号由更换单认下回写，本页不改序列号）');
       } else {
         await dispatch(createInstrument(payload)).unwrap();
         dispatch(patchDraft(payload));
@@ -766,8 +778,14 @@ export default function StationInstruments() {
             name="serialNo"
             label="序列号（全局唯一）"
             rules={[{ required: true, message: '请填写序列号' }]}
+            tooltip={editingInstrument ? '序列号归运维班更换册：只在更换单认下（已更换）时回写，本页编辑不改序列号' : undefined}
           >
-            <Input placeholder="如：CMG-3E-20210418-01" maxLength={60} />
+            <Input
+              placeholder="如：CMG-3E-20210418-01"
+              maxLength={60}
+              readOnly={editingInstrument !== null}
+              disabled={editingInstrument !== null}
+            />
           </Form.Item>
           <Row gutter={12}>
             <Col span={12}>

@@ -62,8 +62,10 @@ export function useCalibHistory(): UseCalibHistoryResult {
       .map((instrument) => {
         const station = stations.find((item) => item.id === instrument.stationId);
         const array = station ? arrays.find((item) => item.id === station.arrayId) : undefined;
+        // 只认当前序列号自己的标定：旧序列号的历次标定归旧序列号，
+        // 换上新序列号但首标未出时，应算「无标定、待标定」
         const rows = calibrations
-          .filter((calibration) => calibration.instrumentId === instrument.id)
+          .filter((calibration) => calibration.instrumentId === instrument.id && calibration.serialSnapshot === instrument.serialNo)
           .sort((a, b) => b.date.localeCompare(a.date));
         const latest = rows.length > 0 ? rows[0] : null;
         const previous = rows.length > 1 ? rows[1] : null;

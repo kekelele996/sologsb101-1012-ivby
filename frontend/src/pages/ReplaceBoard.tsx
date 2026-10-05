@@ -36,10 +36,12 @@ import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
 import {
   createReplace,
+  dismissHoldThunk,
   patchReplaceFilter,
   removeReplace,
   resetReplaceFilter,
   selectCalibrations,
+  selectHolds,
   selectReplaceFilter,
   selectReplaces,
   transitionReplace,
@@ -52,6 +54,7 @@ import {
   type Replace,
   type ReplaceState,
 } from '@/types/replace';
+import { HOLD_KIND_LABEL, HOLD_SOURCE_LABEL, type Hold } from '@/types/hold';
 import { daysUntilDue, type Instrument } from '@/types/instrument';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
 import { initDatabase } from '@/utils/db';
@@ -61,7 +64,6 @@ interface ReplaceFormValues {
   reason: string;
   newSerialNo: string;
   date: dayjs.Dayjs | null;
-  state: ReplaceState;
   operator: string;
   remark: string;
 }
@@ -90,11 +92,14 @@ export default function ReplaceBoard() {
   const arrays = useAppSelector(selectArrays);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const holds = useAppSelector(selectHolds);
   const filter = useAppSelector(selectReplaceFilter);
   const { histories } = useCalibHistory();
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  /** 正在编辑的更换单（认下后锁定序列号/日期/状态） */
+  const [editingReplace, setEditingReplace] = useState<Replace | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<ReplaceFormValues>();
 
@@ -108,12 +113,13 @@ export default function ReplaceBoard() {
       .map((instrument) => {
         const station = stations.find((row) => row.id === instrument.stationId);
         const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
+        // 只认当前序列号自己的标定：旧序列号的历次标定归旧序列号，不代表新序列号已标定
         const own = calibrations
-          .filter((row) => row.instrumentId === instrument.id)
+          .filter((row) => row.instrumentId === instrument.id && row.serialSnapshot === instrument.serialNo)
           .sort((a, b) => b.date.localeCompare(a.date));
         const latest = own[0];
         const lastDate = latest ? latest.date : instrument.installDate;
-        const dueInDays = daysUntilDue(lastDate, instrument.installDate);
+        const dueInDays = daysUntilDue(latest ? latest.date : null, instrument.installDate);
         const replace =
           replaces
             .filter((row) => row.instrumentId === instrument.id)
@@ -178,13 +184,13 @@ export default function ReplaceBoard() {
 
   const openCreate = (instrumentId?: string) => {
     setEditingId(null);
+    setEditingReplace(null);
     const defaultReason = REPLACE_REASON_TEMPLATES[0].reason;
     form.setFieldsValue({
       instrumentId: instrumentId ?? instruments[0]?.id ?? '',
       reason: defaultReason,
       newSerialNo: '',
       date: dayjs(),
-      state: '待更换',
       operator: '周渝',
       remark: '',
     });
@@ -193,12 +199,12 @@ export default function ReplaceBoard() {
 
   const openEdit = (row: Replace) => {
     setEditingId(row.id);
+    setEditingReplace(row);
     form.setFieldsValue({
       instrumentId: row.instrumentId,
       reason: row.reason,
       newSerialNo: row.newSerialNo,
       date: dayjs(row.date),
-      state: row.state,
       operator: row.operator,
       remark: row.remark,
     });
@@ -214,16 +220,15 @@ export default function ReplaceBoard() {
         reason: values.reason.trim(),
         newSerialNo: values.newSerialNo.trim(),
         date: values.date ? values.date.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
-        state: values.state,
         operator: values.operator.trim(),
         remark: values.remark?.trim() ?? '',
       };
       if (editingId) {
-        await dispatch(updateReplace({ id: editingId, patch: payload })).unwrap();
-        message.success('更换记录已更新');
+        const res = await dispatch(updateReplace({ id: editingId, patch: payload })).unwrap();
+        message.success(res.locked ? '认下的更换单已锁定，序列号/日期/状态未改，仅更新可编辑项' : '更换记录已更新');
       } else {
         await dispatch(createReplace(payload)).unwrap();
-        message.success('更换记录已登记，可在下方推进状态机');
+        message.success('更换记录已登记，可在下方推进状态机（认下时才回写新序列号）');
       }
       setModalOpen(false);
     } finally {
@@ -233,12 +238,14 @@ export default function ReplaceBoard() {
 
   const advance = async (row: Replace, next: ReplaceState) => {
     try {
-      await dispatch(transitionReplace({ id: row.id, next })).unwrap();
-      message.success(
-        next === '已更换'
-          ? '更换完成：已回写仪器序列号并置为在用，旧记录已归档'
-          : `更换记录状态已流转到「${next}」`
-      );
+      const result = await dispatch(transitionReplace({ id: row.id, next })).unwrap();
+      if (result.holdId) {
+        message.warning('两侧对不上，新序列号未回写，已挂起等确认');
+      } else if (next === '已更换') {
+        message.success('更换已认下：新序列号已回写，仪器先挂待标定，等它自己的第一次标定');
+      } else {
+        message.success(`更换记录状态已流转到「${next}」`);
+      }
     } catch (error) {
       message.error(typeof error === 'string' ? error : '状态流转失败');
     }
@@ -256,6 +263,18 @@ export default function ReplaceBoard() {
 
   /** 超期仪器提醒（标定周期 365 天） */
   const overdueHistories = histories.filter((history) => history.overdue);
+
+  /** 待确认挂起：运维班认下更换单时与计量站标定册对不上的记录 */
+  const openHolds = useMemo(
+    () => holds.filter((hold) => hold.status === 'open').sort((a, b) => b.updatedAt - a.updatedAt),
+    [holds]
+  );
+
+  /** 运维班暂不处理挂起（认下的更换单不动，只标记挂起） */
+  const handleDismissHold = async (hold: Hold) => {
+    await dispatch(dismissHoldThunk({ id: hold.id, resolution: '运维班确认暂不处理' })).unwrap();
+    message.success('挂起已标记为暂不处理');
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
@@ -311,6 +330,43 @@ export default function ReplaceBoard() {
       ) : (
         <Alert type="success" showIcon message="全部仪器均在标定周期内，无需特别提醒" />
       )}
+
+      {openHolds.length > 0 ? (
+        <Alert
+          type="error"
+          showIcon
+          message={`有 ${openHolds.length} 条更换单与计量站标定册对不上，已挂起等确认（新序列号未回写、更换单未推进）`}
+          description={
+            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+              {openHolds.slice(0, 4).map((hold) => {
+                const instrument = instruments.find((item) => item.id === hold.instrumentId);
+                return (
+                  <div key={hold.id}>
+                    <Space size={8} wrap>
+                      <Tag color="red">{HOLD_KIND_LABEL[hold.kind]}</Tag>
+                      <span>
+                        {HOLD_SOURCE_LABEL[hold.source]}发起 · {instrument?.model ?? '仪器已删除'}（
+                        <span className="gb-mono">{hold.expectedSerialNo}</span>
+                        {hold.actualSerialNo !== hold.expectedSerialNo ? (
+                          <>
+                            {' → 现 '}
+                            <span className="gb-mono">{hold.actualSerialNo}</span>
+                          </>
+                        ) : null}
+                        ）
+                      </span>
+                      <Button size="small" onClick={() => void handleDismissHold(hold)}>
+                        暂不处理
+                      </Button>
+                    </Space>
+                    <div className="gb-hint">{hold.detail}</div>
+                  </div>
+                );
+              })}
+            </Space>
+          }
+        />
+      ) : null}
 
       <FilterBar
         modelValue={filterModel}
@@ -463,12 +519,17 @@ export default function ReplaceBoard() {
             pagination={false}
             columns={[
               {
-                title: '仪器',
-                width: 200,
+                title: '旧序列号 → 新序列号',
+                width: 240,
                 render: (_: unknown, item) => (
                   <div>
                     <div>{item.instrument?.model ?? '仪器已删除'}</div>
-                    <div className="gb-hint gb-mono">{item.row.newSerialNo || '未填新序列号'}</div>
+                    <div className="gb-hint gb-mono">
+                      {item.row.oldSerialNo || '未记录旧号'} → {item.row.newSerialNo || '未填新序列号'}
+                    </div>
+                    {item.row.committedAt !== null ? (
+                      <div className="gb-hint">已认下锁定，不可改不可删</div>
+                    ) : null}
                   </div>
                 ),
               },
@@ -507,22 +568,27 @@ export default function ReplaceBoard() {
                     <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(item.row)}>
                       编辑
                     </Button>
-                    <Popconfirm
-                      title="删除更换记录"
-                      description="确认删除该更换记录？"
-                      okText="删除"
-                      cancelText="取消"
-                      okButtonProps={{ danger: true }}
-                      onConfirm={() =>
-                        void dispatch(removeReplace(item.row.id))
-                          .unwrap()
-                          .then(() => message.success('更换记录已删除'))
-                      }
-                    >
-                      <Button size="small" danger icon={<DeleteOutlined />}>
-                        删除
-                      </Button>
-                    </Popconfirm>
+                    {item.row.committedAt === null ? (
+                      <Popconfirm
+                        title="删除更换记录"
+                        description="确认删除该更换记录？认下后的更换单不可删除。"
+                        okText="删除"
+                        cancelText="取消"
+                        okButtonProps={{ danger: true }}
+                        onConfirm={() =>
+                          void dispatch(removeReplace(item.row.id))
+                            .unwrap()
+                            .then(() => message.success('更换记录已删除'))
+                            .catch((error: unknown) =>
+                              message.error(typeof error === 'string' ? error : '更换记录删除失败')
+                            )
+                        }
+                      >
+                        <Button size="small" danger icon={<DeleteOutlined />}>
+                          删除
+                        </Button>
+                      </Popconfirm>
+                    ) : null}
                   </Space>
                 ),
               },
@@ -551,10 +617,19 @@ export default function ReplaceBoard() {
         destroyOnClose
       >
         <Form form={form} layout="vertical" preserve={false}>
+          {editingReplace && editingReplace.committedAt !== null ? (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="该更换单已认下（已更换），运维班认下的单子不动：仪器、新序列号、日期、状态已锁定"
+            />
+          ) : null}
           <Form.Item name="instrumentId" label="被更换仪器" rules={[{ required: true, message: '请选择仪器' }]}>
             <Select
               showSearch
               optionFilterProp="label"
+              disabled={editingReplace !== null}
               options={instruments.map((instrument) => {
                 const station = stations.find((row) => row.id === instrument.stationId);
                 return {
@@ -577,28 +652,30 @@ export default function ReplaceBoard() {
           </Space>
           <Row gutter={12}>
             <Col span={12}>
-              <Form.Item name="newSerialNo" label="新序列号" rules={[{ required: true, message: '请填写新序列号' }]}>
-                <Input maxLength={60} placeholder="如：CMG-3E-20250410-33" />
+              <Form.Item name="newSerialNo" label="新序列号（认下回写，仪器先挂待标定）" rules={[{ required: true, message: '请填写新序列号' }]}>
+                <Input
+                  maxLength={60}
+                  placeholder="如：CMG-3E-20250410-33"
+                  disabled={(editingReplace?.committedAt ?? null) !== null}
+                />
               </Form.Item>
             </Col>
             <Col span={12}>
               <Form.Item name="date" label="更换日期" rules={[{ required: true }]}>
-                <DatePicker style={{ width: '100%' }} />
+                <DatePicker
+                  style={{ width: '100%' }}
+                  disabled={(editingReplace?.committedAt ?? null) !== null}
+                />
               </Form.Item>
             </Col>
           </Row>
-          <Row gutter={12}>
-            <Col span={12}>
-              <Form.Item name="state" label="状态" rules={[{ required: true }]}>
-                <Select options={REPLACE_STATES.map((state) => ({ label: state, value: state }))} />
-              </Form.Item>
-            </Col>
-            <Col span={12}>
-              <Form.Item name="operator" label="责任人" rules={[{ required: true, message: '请填写责任人' }]}>
-                <Input maxLength={20} placeholder="如：周渝" />
-              </Form.Item>
-            </Col>
-          </Row>
+          <Form.Item
+            name="operator"
+            label="责任人"
+            rules={[{ required: true, message: '请填写责任人' }]}
+          >
+            <Input maxLength={20} placeholder="如：周渝" />
+          </Form.Item>
           <Form.Item name="remark" label="备注">
             <Input.TextArea rows={2} maxLength={100} placeholder="如：新仪器已到货，待停电窗口安装" />
           </Form.Item>

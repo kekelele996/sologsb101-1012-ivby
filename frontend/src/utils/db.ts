@@ -12,9 +12,10 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { Hold } from '@/types/hold';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -36,6 +37,7 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  holds: Hold[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +46,7 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  holds!: Table<Hold, string>;
 
   constructor() {
     super(DB_NAME);
@@ -58,7 +61,7 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
@@ -86,6 +89,66 @@ export class SeisArrayDatabase extends Dexie {
               Object.assign(row, factory());
             });
         }
+      });
+
+    // v3：两册分治（计量站标定册 / 运维班更换册）
+    // - 仪器加 revision 乐观锁，两侧同时保存时后写不再盖先写
+    // - 标定加序列号快照 serialSnapshot，旧序列号历次标定仍归旧序列号
+    // - 更换单加旧序列号、认下基准 revision、认下时间（认下后锁定）
+    // - 新增 holds 挂起表：两边对不上先挂起等确认
+    this.version(DB_VERSION)
+      .stores({
+        arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+        instruments: 'id, stationId, type, model, serialNo, installDate, state, revision, updatedAt',
+        calibrations: 'id, instrumentId, date, serialSnapshot, sensitivity, selfNoise, responseVerdict, updatedAt',
+        replaces: 'id, instrumentId, state, date, oldSerialNo, newSerialNo, committedAt, updatedAt',
+        holds: 'id, instrumentId, source, kind, status, calibrationId, replaceId, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now();
+
+        // 仪器：补 revision 乐观锁版本号
+        await tx
+          .table('instruments')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.revision !== 'number') row.revision = 0;
+          });
+
+        // 标定：补序列号快照（按所属仪器当前序列号回填，首次升级前的档案尚未换号）
+        const instrumentRows = (await tx
+          .table('instruments')
+          .toArray()) as Array<{ id: string; serialNo: string }>;
+        const serialById = new Map(instrumentRows.map((row) => [row.id, row.serialNo]));
+        await tx
+          .table('calibrations')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.serialSnapshot !== 'string' || !row.serialSnapshot) {
+              row.serialSnapshot = serialById.get(String(row.instrumentId)) ?? '';
+            }
+          });
+
+        // 更换单：补旧序列号、认下基准 revision、认下时间
+        await tx
+          .table('replaces')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.oldSerialNo !== 'string') {
+              row.oldSerialNo = serialById.get(String(row.instrumentId)) ?? '';
+            }
+            if (typeof row.baseRevision !== 'number') row.baseRevision = 0;
+            if (!('committedAt' in row)) {
+              // 已更换 / 已复核的历史单子视为早先认下
+              row.committedAt =
+                row.state === '待更换'
+                  ? null
+                  : typeof row.updatedAt === 'number'
+                    ? row.updatedAt
+                    : now;
+            }
+          });
       });
   }
 }
@@ -119,6 +182,8 @@ export function watchTable<T>(
 interface SeedCalibration {
   id: string;
   instrumentId: string;
+  /** 序列号快照：本次标定归哪个序列号 */
+  serialSnapshot: string;
   date: string;
   sensitivity: number;
   selfNoise: number;
@@ -135,6 +200,8 @@ interface SeedInstrument {
   serialNo: string;
   installDate: string;
   state: Instrument['state'];
+  /** 档案版本号：每次计量站 / 运维班回写 +1 */
+  revision: number;
   remark: string;
   calibrations: SeedCalibration[];
 }
@@ -197,11 +264,13 @@ export async function seedDemoData(): Promise<void> {
               serialNo: 'CMG-3E-20210418-01',
               installDate: '2021-04-18',
               state: '在用',
+              revision: 0,
               remark: '主用宽频带，配 24 位采集器',
               calibrations: [
                 {
                   id: 'cal_ltx01_bb_1',
                   instrumentId: 'ins_ltx01_bb',
+                  serialSnapshot: 'CMG-3E-20210418-01',
                   date: '2023-04-20',
                   sensitivity: 1502.4,
                   selfNoise: 1.82,
@@ -212,6 +281,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_ltx01_bb_2',
                   instrumentId: 'ins_ltx01_bb',
+                  serialSnapshot: 'CMG-3E-20210418-01',
                   date: '2024-04-12',
                   sensitivity: 1468.9,
                   selfNoise: 1.95,
@@ -226,20 +296,33 @@ export async function seedDemoData(): Promise<void> {
               stationId: 'stn_ltx_01',
               type: '短周期',
               model: 'FSS-3B',
-              serialNo: 'FSS3B-20210418-02',
+              serialNo: 'FSS3B-20250506-24',
               installDate: '2021-04-18',
-              state: '待标定',
-              remark: '备份仪器，已逾标定周期',
+              state: '在用',
+              revision: 3,
+              remark: '备份仪器；2025-08 更换新序列号，旧序列号标定仍归旧序列号',
               calibrations: [
                 {
                   id: 'cal_ltx01_st_1',
                   instrumentId: 'ins_ltx01_st',
+                  serialSnapshot: 'FSS3B-20210418-02',
                   date: '2022-05-06',
                   sensitivity: 412.6,
                   selfNoise: 2.4,
                   operator: '周渝',
                   agency: '省地震局计量站',
-                  remark: '首次标定',
+                  remark: '首次标定（旧序列号 FSS3B-20210418-02）',
+                },
+                {
+                  id: 'cal_ltx01_st_2',
+                  instrumentId: 'ins_ltx01_st',
+                  serialSnapshot: 'FSS3B-20250506-24',
+                  date: daysAgo(30),
+                  sensitivity: 436.1,
+                  selfNoise: 2.1,
+                  operator: '陈立群',
+                  agency: '省地震局计量站',
+                  remark: '新序列号自己的第一次标定，合格后转在用',
                 },
               ],
             },
@@ -263,11 +346,13 @@ export async function seedDemoData(): Promise<void> {
               serialNo: 'T120-20220315-07',
               installDate: '2022-03-15',
               state: '在用',
+              revision: 0,
               remark: '井下安装，深度 42 m',
               calibrations: [
                 {
                   id: 'cal_ltx02_bb_1',
                   instrumentId: 'ins_ltx02_bb',
+                  serialSnapshot: 'T120-20220315-07',
                   date: '2024-03-18',
                   sensitivity: 1204.8,
                   selfNoise: 1.42,
@@ -285,11 +370,13 @@ export async function seedDemoData(): Promise<void> {
               serialNo: 'L4C-20220315-08',
               installDate: '2022-03-15',
               state: '已停用',
+              revision: 0,
               remark: '2024 年雷击损坏，已提交更换',
               calibrations: [
                 {
                   id: 'cal_ltx02_st_1',
                   instrumentId: 'ins_ltx02_st',
+                  serialSnapshot: 'L4C-20220315-08',
                   date: '2023-03-10',
                   sensitivity: 265.2,
                   selfNoise: 4.8,
@@ -316,20 +403,22 @@ export async function seedDemoData(): Promise<void> {
               stationId: 'stn_ltx_03',
               type: '宽频带',
               model: 'STS-2.5',
-              serialNo: 'STS25-20230902-11',
+              serialNo: 'STS25-20250920-55',
               installDate: '2023-09-02',
-              state: '在用',
-              remark: '新建站首台仪器',
+              state: '待标定',
+              revision: 2,
+              remark: '10 天前换上新序列号，等它自己的第一次标定；旧序列号标定仍归旧序列号',
               calibrations: [
                 {
                   id: 'cal_ltx03_bb_1',
                   instrumentId: 'ins_ltx03_bb',
+                  serialSnapshot: 'STS25-20230902-11',
                   date: '2024-09-05',
                   sensitivity: 2251.3,
                   selfNoise: 2.05,
                   operator: '林之遥',
                   agency: '省地震局计量站',
-                  remark: '脉冲响应合格',
+                  remark: '旧序列号的标定，归旧序列号 STS25-20230902-11',
                 },
               ],
             },
@@ -363,11 +452,13 @@ export async function seedDemoData(): Promise<void> {
               serialNo: 'TC-20190925-03',
               installDate: '2019-09-25',
               state: '在用',
+              revision: 0,
               remark: '海岛主用观测设备',
               calibrations: [
                 {
                   id: 'cal_hx01_bb_1',
                   instrumentId: 'ins_hx01_bb',
+                  serialSnapshot: 'TC-20190925-03',
                   date: '2023-09-28',
                   sensitivity: 1498.2,
                   selfNoise: 2.25,
@@ -378,6 +469,7 @@ export async function seedDemoData(): Promise<void> {
                 {
                   id: 'cal_hx01_bb_2',
                   instrumentId: 'ins_hx01_bb',
+                  serialSnapshot: 'TC-20190925-03',
                   date: '2024-09-30',
                   sensitivity: 1483.6,
                   selfNoise: 2.42,
@@ -395,11 +487,13 @@ export async function seedDemoData(): Promise<void> {
               serialNo: 'EST-20190925-04',
               installDate: '2019-09-25',
               state: '在用',
+              revision: 0,
               remark: '结构台阵强震观测',
               calibrations: [
                 {
                   id: 'cal_hx01_sm_1',
                   instrumentId: 'ins_hx01_sm',
+                  serialSnapshot: 'EST-20190925-04',
                   date: '2024-09-30',
                   sensitivity: 1.24,
                   selfNoise: 1.05,
@@ -426,20 +520,22 @@ export async function seedDemoData(): Promise<void> {
               stationId: 'stn_hx_02',
               type: '宽频带',
               model: 'CMG-3ESPC',
-              serialNo: 'CMG-3E-20190926-05',
+              serialNo: 'CMG-3E-20250410-33',
               installDate: '2019-09-26',
               state: '待标定',
-              remark: '夜间自噪抬升，待复标',
+              revision: 2,
+              remark: '已换上新序列号，等这个序列号自己的第一次标定；旧序列号标定仍归旧序列号',
               calibrations: [
                 {
                   id: 'cal_hx02_bb_1',
                   instrumentId: 'ins_hx02_bb',
+                  serialSnapshot: 'CMG-3E-20190926-05',
                   date: '2023-06-11',
                   sensitivity: 1388.4,
                   selfNoise: 3.9,
                   operator: '林之遥',
                   agency: '国家测震台网计量中心',
-                  remark: '自噪接近上限，判定不合格',
+                  remark: '旧序列号自噪超标，判定不合格（归旧序列号 CMG-3E-20190926-05）',
                 },
               ],
             },
@@ -454,9 +550,12 @@ export async function seedDemoData(): Promise<void> {
       id: 'rpl_ltx02_st',
       instrumentId: 'ins_ltx02_st',
       reason: '雷击导致仪器损坏，标定不合格',
+      oldSerialNo: 'L4C-20220315-08',
       newSerialNo: 'L4C-20250301-21',
       date: today,
       state: '待更换',
+      baseRevision: 0,
+      committedAt: null,
       operator: '周渝',
       remark: '新仪器已到货，待停电窗口安装',
       createdAt: now,
@@ -466,11 +565,14 @@ export async function seedDemoData(): Promise<void> {
       id: 'rpl_hx02_bb',
       instrumentId: 'ins_hx02_bb',
       reason: '自噪持续超标，按台网要求整机更换',
+      oldSerialNo: 'CMG-3E-20190926-05',
       newSerialNo: 'CMG-3E-20250410-33',
       date: daysAgo(20),
       state: '已更换',
+      baseRevision: 1,
+      committedAt: now - 20 * 86400000,
       operator: '林之遥',
-      remark: '已完成安装，待复核标定',
+      remark: '已完成安装，新序列号先挂待标定，等它自己的第一次标定',
       createdAt: now - 20 * 86400000,
       updatedAt: now - 18 * 86400000,
     },
@@ -478,19 +580,60 @@ export async function seedDemoData(): Promise<void> {
       id: 'rpl_ltx01_st',
       instrumentId: 'ins_ltx01_st',
       reason: '超期未标定，更换为新型号',
+      oldSerialNo: 'FSS3B-20210418-02',
       newSerialNo: 'FSS3B-20250506-24',
       date: daysAgo(60),
       state: '已复核',
+      baseRevision: 1,
+      committedAt: now - 60 * 86400000,
       operator: '陈立群',
-      remark: '复核标定合格，序列号已回写',
+      remark: '新序列号首次标定合格后复核闭环',
       createdAt: now - 60 * 86400000,
       updatedAt: now - 30 * 86400000,
+    },
+    {
+      id: 'rpl_ltx03_bb',
+      instrumentId: 'ins_ltx03_bb',
+      reason: '设备升级换代，更换为新型号',
+      oldSerialNo: 'STS25-20230902-11',
+      newSerialNo: 'STS25-20250920-55',
+      date: daysAgo(10),
+      state: '已更换',
+      baseRevision: 1,
+      committedAt: now - 10 * 86400000,
+      operator: '周渝',
+      remark: '新序列号先挂待标定，等它自己的第一次标定',
+      createdAt: now - 10 * 86400000,
+      updatedAt: now - 10 * 86400000,
+    },
+  ];
+
+  // 挂起样本：运维班先把 LTX03 换成新序列号，计量站随后按旧序列号录标定，
+  // 序列号对不上 → 标定照存（归旧序列号），仪器状态不动，先挂起等确认
+  const holds: Hold[] = [
+    {
+      id: 'hold_ltx03_serial',
+      instrumentId: 'ins_ltx03_bb',
+      source: 'calibration',
+      kind: 'serial-mismatch',
+      expectedSerialNo: 'STS25-20230902-11',
+      actualSerialNo: 'STS25-20250920-55',
+      expectedRevision: 1,
+      actualRevision: 2,
+      calibrationId: 'cal_ltx03_bb_1',
+      replaceId: 'rpl_ltx03_bb',
+      detail: '计量站按旧序列号 STS25-20230902-11 录标定，运维班已把档案换成新序列号 STS25-20250920-55；标定归旧序列号，仪器状态未改写，待确认。',
+      status: 'open',
+      resolution: '',
+      createdAt: now - 5 * 86400000,
+      updatedAt: now - 5 * 86400000,
+      resolvedAt: null,
     },
   ];
 
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.holds],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -537,6 +680,7 @@ export async function seedDemoData(): Promise<void> {
       await db.instruments.bulkPut(instrumentRows);
       await db.calibrations.bulkPut(calibrationRows);
       await db.replaces.bulkPut(replaces);
+      await db.holds.bulkPut(holds);
     }
   );
 }
@@ -555,7 +699,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.holds],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,6 +707,7 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.holds.clear(),
       ]);
     }
   );
@@ -576,14 +721,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, holds] = await Promise.all([
     db.arrays.count(),
     db.stations.count(),
     db.instruments.count(),
     db.calibrations.count(),
     db.replaces.count(),
+    db.holds.count(),
   ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  return { arrays, stations, instruments, calibrations, replaces, holds };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */

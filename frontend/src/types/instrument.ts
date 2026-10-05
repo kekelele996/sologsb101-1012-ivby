@@ -24,8 +24,13 @@ export interface Instrument {
   serialNo: string;
   /** 安装日期 */
   installDate: string;
-  /** 状态 */
+  /** 状态（序列号更换后先挂「待标定」，由本序列号自己的首次标定定状态） */
   state: InstrumentState;
+  /**
+   * 档案版本号（乐观锁）：计量站录标定、运维班推更换单前都要核对。
+   * 两边同时保存时，revision 对不上的一侧不覆盖，转挂起等确认。
+   */
+  revision: number;
   /** 备注 */
   remark: string;
   createdAt: number;

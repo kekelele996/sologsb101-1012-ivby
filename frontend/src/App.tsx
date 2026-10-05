@@ -12,6 +12,7 @@ import {
   GlobalOutlined,
   SwapOutlined,
   ThunderboltOutlined,
+  WarningFilled,
 } from '@ant-design/icons';
 import { ROUTES } from '@/router';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
@@ -28,6 +29,7 @@ import {
 import {
   selectCalibrations,
   selectReplaces,
+  selectHolds,
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
@@ -54,6 +56,7 @@ export default function App() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const holds = useAppSelector(selectHolds);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
   const ready = useAppSelector((state) => state.array.ready);
 
@@ -83,6 +86,7 @@ export default function App() {
   const selectedKey = buildSelectedKey(location.pathname, currentArrayId);
   const unqualified = calibrations.filter((row) => row.responseVerdict === '不合格').length;
   const pendingReplaces = replaces.filter((row) => row.state !== '已复核').length;
+  const openHoldCount = holds.filter((row) => row.status === 'open').length;
 
   return (
     <>
@@ -135,6 +139,11 @@ export default function App() {
               <span>
                 <SwapOutlined /> 更换未闭环 {pendingReplaces}
               </span>
+              {openHoldCount > 0 ? (
+                <span style={{ color: '#ff9c8a' }}>
+                  <WarningFilled /> 两册对不上待确认 {openHoldCount}
+                </span>
+              ) : null}
             </Space>
           </div>
         </Sider>
@@ -172,6 +181,9 @@ export default function App() {
               <Badge count={calibrations.length} showZero color="#3f7bbf" title="标定记录总数" />
               <Badge count={unqualified} showZero color="#c0392b" title="不合格标定" />
               <Badge count={pendingReplaces} showZero color="#d68910" title="未闭环更换" />
+              {openHoldCount > 0 ? (
+                <Badge count={openHoldCount} color="#c0392b" title="两册对不上待确认" />
+              ) : null}
               {currentArrayId ? (
                 <Button size="small" onClick={() => navigate(ROUTES.stations(currentArrayId))}>
                   台站仪器
