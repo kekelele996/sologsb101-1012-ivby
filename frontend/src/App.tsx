@@ -8,6 +8,7 @@ import { Badge, Button, Layout, Menu, Space, Tag, Typography, message } from 'an
 import {
   AppstoreOutlined,
   DashboardOutlined,
+  ExclamationCircleFilled,
   ExperimentOutlined,
   GlobalOutlined,
   SwapOutlined,
@@ -27,9 +28,13 @@ import {
 } from '@/stores/instrumentSlice';
 import {
   selectCalibrations,
-  selectReplaces,
   startCalibrationSubscription,
 } from '@/stores/calibrationSlice';
+import {
+  selectPendingReconciliations,
+  selectReplaces,
+  startReplaceSubscription,
+} from '@/stores/replaceSlice';
 import { DB_NAME, DB_VERSION, initDatabase } from '@/utils/db';
 
 const { Header, Sider, Content, Footer } = Layout;
@@ -54,6 +59,7 @@ export default function App() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const pendingReconciles = useAppSelector(selectPendingReconciliations);
   const currentArrayId = useAppSelector(selectCurrentArrayId);
   const ready = useAppSelector((state) => state.array.ready);
 
@@ -67,6 +73,7 @@ export default function App() {
         startArraySubscription(dispatch);
         startInstrumentSubscription(dispatch);
         startCalibrationSubscription(dispatch);
+        startReplaceSubscription(dispatch);
       } catch (error) {
         if (cancelled) return;
         messageApi.error(
@@ -81,8 +88,11 @@ export default function App() {
 
   const currentArray = arrays.find((row) => row.id === currentArrayId) ?? null;
   const selectedKey = buildSelectedKey(location.pathname, currentArrayId);
-  const unqualified = calibrations.filter((row) => row.responseVerdict === '不合格').length;
+  const unqualified = calibrations.filter(
+    (row) => row.responseVerdict === '不合格' && row.reconcileState === '已对齐'
+  ).length;
   const pendingReplaces = replaces.filter((row) => row.state !== '已复核').length;
+  const suspendedCount = pendingReconciles.length;
 
   return (
     <>
@@ -117,7 +127,20 @@ export default function App() {
                 disabled: !currentArrayId,
               },
               { key: ROUTES.calibrations, icon: <DashboardOutlined />, label: '标定记录台' },
-              { key: ROUTES.replacements, icon: <SwapOutlined />, label: '合格评定与更换' },
+              {
+                key: ROUTES.replacements,
+                icon: <SwapOutlined />,
+                label: (
+                  <span>
+                    合格评定与更换
+                    {suspendedCount > 0 ? (
+                      <Tag color="red" style={{ marginInlineStart: 8, fontSize: 11, lineHeight: '16px' }}>
+                        挂起 {suspendedCount}
+                      </Tag>
+                    ) : null}
+                  </span>
+                ),
+              },
               { key: ROUTES.geometry, icon: <GlobalOutlined />, label: '台阵几何与备份' },
             ]}
           />
@@ -135,6 +158,11 @@ export default function App() {
               <span>
                 <SwapOutlined /> 更换未闭环 {pendingReplaces}
               </span>
+              {suspendedCount > 0 ? (
+                <span style={{ color: '#ff7875' }}>
+                  <ExclamationCircleFilled /> 两册挂起 {suspendedCount}
+                </span>
+              ) : null}
             </Space>
           </div>
         </Sider>
@@ -172,6 +200,7 @@ export default function App() {
               <Badge count={calibrations.length} showZero color="#3f7bbf" title="标定记录总数" />
               <Badge count={unqualified} showZero color="#c0392b" title="不合格标定" />
               <Badge count={pendingReplaces} showZero color="#d68910" title="未闭环更换" />
+              <Badge count={suspendedCount} showZero={false} color="#c0392b" title="两册挂起待确认" />
               {currentArrayId ? (
                 <Button size="small" onClick={() => navigate(ROUTES.stations(currentArrayId))}>
                   台站仪器

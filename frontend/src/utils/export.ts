@@ -15,19 +15,27 @@ import type { ResponseVerdict } from '@/types/calibration';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+export const BACKUP_KEYS = [
+  'arrays',
+  'stations',
+  'instruments',
+  'calibrations',
+  'replaces',
+  'reconciliations',
+] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, reconciliations] = await Promise.all([
     db.arrays.toArray(),
     db.stations.toArray(),
     db.instruments.toArray(),
     db.calibrations.toArray(),
     db.replaces.toArray(),
+    db.reconciliations.toArray(),
   ]);
   return {
     app: 'gbseisarray',
@@ -38,6 +46,7 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     instruments,
     calibrations,
     replaces,
+    reconciliations,
   };
 }
 
@@ -55,7 +64,7 @@ export function validateBackup(input: unknown): {
   if (obj.app !== undefined && obj.app !== 'gbseisarray') {
     errors.push('app 字段应为 gbseisarray，文件来源不明');
   }
-  for (const key of BACKUP_KEYS) {
+  for (const key of ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`);
   }
   if (errors.length > 0) return { ok: false, errors, payload: null };
@@ -68,6 +77,7 @@ export function validateBackup(input: unknown): {
     instruments: obj.instruments ?? [],
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
+    reconciliations: Array.isArray(obj.reconciliations) ? obj.reconciliations : [],
   };
   return { ok: true, errors, payload };
 }
@@ -80,6 +90,7 @@ export function countPayload(payload: BackupPayload): CountMap {
     instruments: payload.instruments.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
+    reconciliations: payload.reconciliations.length,
   };
 }
 
@@ -117,13 +128,14 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.reconciliations],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
+      await db.reconciliations.bulkPut(payload.reconciliations);
     }
   );
   return countPayload(payload);
@@ -155,12 +167,27 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('cal'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
+  const calibrationMap = new Map<string, string>();
+  payload.calibrations.forEach((row, index) => {
+    calibrationMap.set(row.id, calibrations[index].id);
+  });
   const replaces = payload.replaces.map((row) => ({
     ...row,
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  const replaceMap = new Map<string, string>();
+  payload.replaces.forEach((row, index) => {
+    replaceMap.set(row.id, replaces[index].id);
+  });
+  const reconciliations = payload.reconciliations.map((row) => ({
+    ...row,
+    id: createId('rec'),
+    instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
+    calibrationId: row.calibrationId ? calibrationMap.get(row.calibrationId) ?? '' : '',
+    replaceId: row.replaceId ? replaceMap.get(row.replaceId) ?? '' : '',
+  }));
+  return { ...payload, arrays, stations, instruments, calibrations, replaces, reconciliations };
 }
 
 /** 按台阵汇总的几何与标定结论 */
@@ -198,9 +225,14 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
     const stations = payload.stations.filter((station) => station.arrayId === array.id);
     const stationIds = new Set(stations.map((station) => station.id));
     const instruments = payload.instruments.filter((instrument) => stationIds.has(instrument.stationId));
+    const instrumentById = new Map(instruments.map((instrument) => [instrument.id, instrument]));
     const instrumentIds = new Set(instruments.map((instrument) => instrument.id));
-    const calibrations = payload.calibrations.filter((calibration) =>
-      instrumentIds.has(calibration.instrumentId)
+    // 仅统计「已对齐」且序列号仍是当前序列号的标定：挂起记录与旧序列号历史不进评定
+    const calibrations = payload.calibrations.filter(
+      (calibration) =>
+        instrumentIds.has(calibration.instrumentId) &&
+        calibration.reconcileState === '已对齐' &&
+        instrumentById.get(calibration.instrumentId)?.serialNo === calibration.serialNo
     );
     const replaces = payload.replaces.filter((replace) => instrumentIds.has(replace.instrumentId));
 

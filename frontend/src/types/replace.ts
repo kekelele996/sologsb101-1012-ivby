@@ -10,14 +10,16 @@ export const REPLACE_TRANSITIONS: Record<ReplaceState, ReplaceState[]> = {
   已复核: ['待更换']
 };
 
-/** 更换：仪器故障或超期后的更换记录 */
+/** 更换：仪器故障或超期后的更换记录（运维班更换册） */
 export interface Replace {
   id: string;
-  /** 被更换仪器 */
+  /** 被更换仪器档案 id */
   instrumentId: string;
   /** 更换原因 */
   reason: string;
-  /** 新序列号（更换完成后回写仪器） */
+  /** 登记更换单时档案上的旧序列号（推进回写的 CAS 依据，对不上先挂起） */
+  oldSerialNo: string;
+  /** 新序列号（流转到「已更换」时回写仪器，随后挂「待标定」等首次标定） */
   newSerialNo: string;
   /** 更换日期 */
   date: string;

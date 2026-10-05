@@ -58,7 +58,8 @@ import {
   selectInstrumentsOfStation,
   updateInstrument,
 } from '@/stores/instrumentSlice';
-import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectCalibrations } from '@/stores/calibrationSlice';
+import { selectReplaces } from '@/stores/replaceSlice';
 import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
 import {
   COMMON_MODELS,
@@ -158,15 +159,21 @@ export default function StationInstruments() {
             (instrument) => instrument.stationId === station.id
           );
           const instrumentIds = new Set(stationInstruments.map((instrument) => instrument.id));
-          const stationCalibrations = calibrations.filter((calibration) =>
-            instrumentIds.has(calibration.instrumentId)
+          const stationCalibrations = calibrations.filter(
+            (calibration) =>
+              instrumentIds.has(calibration.instrumentId) && calibration.reconcileState === '已对齐'
           );
           const unqualified = stationCalibrations.filter(
             (calibration) => calibration.responseVerdict === '不合格'
           ).length;
           const overdue = stationInstruments.filter((instrument) => {
             const own = calibrations
-              .filter((calibration) => calibration.instrumentId === instrument.id)
+              .filter(
+                (calibration) =>
+                  calibration.instrumentId === instrument.id &&
+                  calibration.serialNo === instrument.serialNo &&
+                  calibration.reconcileState === '已对齐'
+              )
               .sort((a, b) => b.date.localeCompare(a.date));
             const last = own.length > 0 ? own[0].date : instrument.installDate;
             return daysUntilDue(last, instrument.installDate) < 0;
@@ -611,7 +618,14 @@ export default function StationInstruments() {
                   align: 'right',
                   render: (_: unknown, instrument: Instrument) => (
                     <span className="gb-mono">
-                      {calibrations.filter((row) => row.instrumentId === instrument.id).length}
+                      {
+                        calibrations.filter(
+                          (row) =>
+                            row.instrumentId === instrument.id &&
+                            row.serialNo === instrument.serialNo &&
+                            row.reconcileState === '已对齐'
+                        ).length
+                      }
                     </span>
                   ),
                 },
@@ -620,11 +634,20 @@ export default function StationInstruments() {
                   width: 180,
                   render: (_: unknown, instrument: Instrument) => {
                     const own = calibrations
-                      .filter((row) => row.instrumentId === instrument.id)
+                      .filter(
+                        (row) =>
+                          row.instrumentId === instrument.id &&
+                          row.serialNo === instrument.serialNo &&
+                          row.reconcileState === '已对齐'
+                      )
                       .sort((a, b) => b.date.localeCompare(a.date));
                     const latest = own[0];
                     if (!latest) {
-                      return <span className="gb-hint">尚未标定</span>;
+                      return (
+                        <span className="gb-hint">
+                          {instrument.state === '待标定' ? '待该序列号首次标定' : '尚未标定'}
+                        </span>
+                      );
                     }
                     return (
                       <QualifyTag
@@ -640,7 +663,12 @@ export default function StationInstruments() {
                   width: 130,
                   render: (_: unknown, instrument: Instrument) => {
                     const own = calibrations
-                      .filter((row) => row.instrumentId === instrument.id)
+                      .filter(
+                        (row) =>
+                          row.instrumentId === instrument.id &&
+                          row.serialNo === instrument.serialNo &&
+                          row.reconcileState === '已对齐'
+                      )
                       .sort((a, b) => b.date.localeCompare(a.date));
                     const last = own.length > 0 ? own[0].date : instrument.installDate;
                     const days = daysUntilDue(last, instrument.installDate);
@@ -694,7 +722,7 @@ export default function StationInstruments() {
 
       <p className="gb-hint">
         更换提醒：当仪器标定超期或结论不合格时，可到「合格评定与更换」页登记更换并跟踪到复核闭环；
-        更换完成后将自动把新序列号回写到仪器档案。当前共 {replaces.length} 条更换记录。
+        推进到「已更换」时新序列号会回写到仪器档案并挂「待标定」，等该序列号第一次标定合格后转在用，旧序列号历次标定不并入新序列号。当前共 {replaces.length} 条更换记录。
       </p>
 
       <Modal

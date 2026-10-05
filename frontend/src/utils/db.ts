@@ -12,9 +12,10 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { Reconciliation } from '@/types/reconcile';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -36,6 +37,7 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  reconciliations: Reconciliation[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +46,7 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  reconciliations!: Table<Reconciliation, string>;
 
   constructor() {
     super(DB_NAME);
@@ -58,7 +61,7 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
@@ -86,6 +89,53 @@ export class SeisArrayDatabase extends Dexie {
               Object.assign(row, factory());
             });
         }
+      });
+
+    // v3：两册分治——标定记录加序列号快照与对账状态、更换单加旧序列号、新增挂起台账 reconciliations
+    this.version(DB_VERSION)
+      .stores({
+        arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+        instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+        calibrations:
+          'id, instrumentId, serialNo, date, sensitivity, selfNoise, responseVerdict, reconcileState, updatedAt',
+        replaces: 'id, instrumentId, state, date, oldSerialNo, newSerialNo, updatedAt',
+        reconciliations: 'id, instrumentId, type, side, state, calibrationId, replaceId, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 历史标定：序列号快照按所属仪器当前序列号回填（v2 尚无更换快照，无法细分到旧序列号）
+        const instruments = await tx.table('instruments').toArray() as Array<{
+          id: string;
+          serialNo?: unknown;
+        }>;
+        const serialById = new Map<string, string>(
+          instruments.map((row) => [row.id, typeof row.serialNo === 'string' ? row.serialNo : ''])
+        );
+        await tx
+          .table('calibrations')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.serialNo !== 'string') {
+              row.serialNo = serialById.get(String(row.instrumentId)) ?? '';
+            }
+            if (row.reconcileState !== '已对齐' && row.reconcileState !== '待确认' && row.reconcileState !== '已撤销') {
+              row.reconcileState = '已对齐';
+            }
+            if (typeof row.reconciliationId !== 'string') row.reconciliationId = '';
+          });
+
+        // 历史更换单：旧序列号取仪器当前序列号（当前序列号已是新号的已复核单可能不准，仅作兜底）
+        await tx
+          .table('replaces')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.oldSerialNo !== 'string') {
+              row.oldSerialNo =
+                row.state === '待更换'
+                  ? serialById.get(String(row.instrumentId)) ?? ''
+                  : '';
+            }
+          });
       });
   }
 }
@@ -119,12 +169,16 @@ export function watchTable<T>(
 interface SeedCalibration {
   id: string;
   instrumentId: string;
+  /** 序列号快照：缺省时落库统一回填仪器当前 serialNo；旧序列号的历史标定显式给旧号 */
+  serialNo?: string;
   date: string;
   sensitivity: number;
   selfNoise: number;
   operator: string;
   agency: string;
   remark: string;
+  /** 对账状态：默认已对齐；挂起演示样本显式给「待确认」 */
+  reconcileState?: Calibration['reconcileState'];
 }
 
 interface SeedInstrument {
@@ -162,8 +216,8 @@ interface SeedArray {
 }
 
 /**
- * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换，
- * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本。
+ * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 12 条标定 + 3 条更换 + 1 条挂起，
+ * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」、超期未标定、换号后等待首次标定及序列号对不上挂起样本。
  */
 export async function seedDemoData(): Promise<void> {
   const now = Date.now();
@@ -226,20 +280,21 @@ export async function seedDemoData(): Promise<void> {
               stationId: 'stn_ltx_01',
               type: '短周期',
               model: 'FSS-3B',
-              serialNo: 'FSS3B-20210418-02',
+              serialNo: 'FSS3B-20250506-24',
               installDate: '2021-04-18',
               state: '待标定',
-              remark: '备份仪器，已逾标定周期',
+              remark: '已换上新序列号，等待该序列号自己的第一次标定（旧号已超期）',
               calibrations: [
                 {
                   id: 'cal_ltx01_st_1',
                   instrumentId: 'ins_ltx01_st',
+                  serialNo: 'FSS3B-20210418-02',
                   date: '2022-05-06',
                   sensitivity: 412.6,
                   selfNoise: 2.4,
                   operator: '周渝',
                   agency: '省地震局计量站',
-                  remark: '首次标定',
+                  remark: '旧序列号 FSS3B-20210418-02 的首次标定；更换后历次标定仍归旧序列号',
                 },
               ],
             },
@@ -285,17 +340,18 @@ export async function seedDemoData(): Promise<void> {
               serialNo: 'L4C-20220315-08',
               installDate: '2022-03-15',
               state: '已停用',
-              remark: '2024 年雷击损坏，已提交更换',
+              remark: '2024 年雷击损坏，已登记更换单等待停电窗口',
               calibrations: [
                 {
                   id: 'cal_ltx02_st_1',
                   instrumentId: 'ins_ltx02_st',
+                  serialNo: 'L4C-20220315-08',
                   date: '2023-03-10',
                   sensitivity: 265.2,
                   selfNoise: 4.8,
                   operator: '周渝',
                   agency: '省地震局计量站',
-                  remark: '自噪超标，判定不合格',
+                  remark: '自噪超标，判定不合格；该序列号若被换下，历次标定仍归本序列号',
                 },
               ],
             },
@@ -330,6 +386,18 @@ export async function seedDemoData(): Promise<void> {
                   operator: '林之遥',
                   agency: '省地震局计量站',
                   remark: '脉冲响应合格',
+                },
+                {
+                  id: 'cal_ltx03_bb_2',
+                  instrumentId: 'ins_ltx03_bb',
+                  serialNo: 'STS25-20230902-99',
+                  date: daysAgo(2),
+                  sensitivity: 2238.0,
+                  selfNoise: 2.2,
+                  operator: '陈立群',
+                  agency: '省地震局计量站',
+                  remark: '序列号录成 STS25-20230902-99，与档案 STS25-20230902-11 对不上（挂起演示）',
+                  reconcileState: '待确认',
                 },
               ],
             },
@@ -426,20 +494,32 @@ export async function seedDemoData(): Promise<void> {
               stationId: 'stn_hx_02',
               type: '宽频带',
               model: 'CMG-3ESPC',
-              serialNo: 'CMG-3E-20190926-05',
+              serialNo: 'CMG-3E-20250410-33',
               installDate: '2019-09-26',
-              state: '待标定',
-              remark: '夜间自噪抬升，待复标',
+              state: '在用',
+              remark: '新序列号自己的第一次标定已合格，按结论转在用；旧序列号历次标定仍归旧号',
               calibrations: [
                 {
                   id: 'cal_hx02_bb_1',
                   instrumentId: 'ins_hx02_bb',
+                  serialNo: 'CMG-3E-20190926-05',
                   date: '2023-06-11',
                   sensitivity: 1388.4,
                   selfNoise: 3.9,
                   operator: '林之遥',
                   agency: '国家测震台网计量中心',
-                  remark: '自噪接近上限，判定不合格',
+                  remark: '旧序列号 CMG-3E-20190926-05 的末次标定：自噪接近上限，判定不合格；换号后仍归旧序列号',
+                },
+                {
+                  id: 'cal_hx02_bb_2',
+                  instrumentId: 'ins_hx02_bb',
+                  serialNo: 'CMG-3E-20250410-33',
+                  date: daysAgo(3),
+                  sensitivity: 1506.8,
+                  selfNoise: 1.9,
+                  operator: '陈立群',
+                  agency: '国家测震台网计量中心',
+                  remark: '新序列号自己的第一次标定（演示用）',
                 },
               ],
             },
@@ -454,11 +534,12 @@ export async function seedDemoData(): Promise<void> {
       id: 'rpl_ltx02_st',
       instrumentId: 'ins_ltx02_st',
       reason: '雷击导致仪器损坏，标定不合格',
+      oldSerialNo: 'L4C-20220315-08',
       newSerialNo: 'L4C-20250301-21',
       date: today,
       state: '待更换',
       operator: '周渝',
-      remark: '新仪器已到货，待停电窗口安装',
+      remark: '新仪器已到货，待停电窗口安装；换上后先挂待标定',
       createdAt: now,
       updatedAt: now,
     },
@@ -466,31 +547,53 @@ export async function seedDemoData(): Promise<void> {
       id: 'rpl_hx02_bb',
       instrumentId: 'ins_hx02_bb',
       reason: '自噪持续超标，按台网要求整机更换',
+      oldSerialNo: 'CMG-3E-20190926-05',
       newSerialNo: 'CMG-3E-20250410-33',
       date: daysAgo(20),
-      state: '已更换',
+      state: '已复核',
       operator: '林之遥',
-      remark: '已完成安装，待复核标定',
+      remark: '新序列号已回写并挂待标定，其第一次标定合格后转在用，闭环完成',
       createdAt: now - 20 * 86400000,
-      updatedAt: now - 18 * 86400000,
+      updatedAt: now - 2 * 86400000,
     },
     {
       id: 'rpl_ltx01_st',
       instrumentId: 'ins_ltx01_st',
       reason: '超期未标定，更换为新型号',
+      oldSerialNo: 'FSS3B-20210418-02',
       newSerialNo: 'FSS3B-20250506-24',
       date: daysAgo(60),
-      state: '已复核',
+      state: '已更换',
       operator: '陈立群',
-      remark: '复核标定合格，序列号已回写',
+      remark: '序列号已回写，新序列号尚未首次标定，按规则仍挂待标定',
       createdAt: now - 60 * 86400000,
       updatedAt: now - 30 * 86400000,
     },
   ];
 
+  const reconciliations: Reconciliation[] = [
+    {
+      id: 'rec_ltx03_bb_serial',
+      type: 'calibration-serial-mismatch',
+      side: 'metrology',
+      instrumentId: 'ins_ltx03_bb',
+      currentSerialNo: 'STS25-20230902-11',
+      claimedSerialNo: 'STS25-20230902-99',
+      calibrationId: 'cal_ltx03_bb_2',
+      replaceId: '',
+      reason:
+        '计量站按序列号「STS25-20230902-99」录入标定，但仪器档案当前序列号为「STS25-20230902-11」，标定记录已挂起，仪器状态未改动',
+      resolution: '',
+      state: '待确认',
+      operator: '陈立群',
+      createdAt: now - 2 * 86400000,
+      updatedAt: now - 2 * 86400000,
+    },
+  ];
+
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.reconciliations],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -522,7 +625,12 @@ export async function seedDemoData(): Promise<void> {
               );
               calibrationRows.push({
                 ...calibrationSeed,
+                // 序列号快照：缺省回填仪器当前序列号（旧序列号的历史标定显式给旧号）
+                serialNo: calibrationSeed.serialNo ?? instrumentRest.serialNo,
                 responseVerdict: verdict,
+                reconcileState: calibrationSeed.reconcileState ?? '已对齐',
+                reconciliationId:
+                  calibrationSeed.reconcileState === '待确认' ? 'rec_ltx03_bb_serial' : '',
                 ...stamp(
                   400 + arrayIndex * 400 + stationIndex * 100 + instrumentIndex * 20 + calibrationIndex
                 ),
@@ -537,6 +645,7 @@ export async function seedDemoData(): Promise<void> {
       await db.instruments.bulkPut(instrumentRows);
       await db.calibrations.bulkPut(calibrationRows);
       await db.replaces.bulkPut(replaces);
+      await db.reconciliations.bulkPut(reconciliations);
     }
   );
 }
@@ -555,7 +664,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.reconciliations],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,6 +672,7 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.reconciliations.clear(),
       ]);
     }
   );
@@ -576,14 +686,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, reconciliations] = await Promise.all([
     db.arrays.count(),
     db.stations.count(),
     db.instruments.count(),
     db.calibrations.count(),
     db.replaces.count(),
+    db.reconciliations.count(),
   ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  return { arrays, stations, instruments, calibrations, replaces, reconciliations };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */

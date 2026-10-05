@@ -46,7 +46,8 @@ import {
   updateArray,
 } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
-import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectCalibrations } from '@/stores/calibrationSlice';
+import { selectReplaces } from '@/stores/replaceSlice';
 import { APERTURE_BUCKETS, ARRAY_STATES, type ArrayState, type SeisArray } from '@/types/array';
 import { apertureKm, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';

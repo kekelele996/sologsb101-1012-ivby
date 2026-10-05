@@ -39,12 +39,15 @@ import {
   patchReplaceFilter,
   removeReplace,
   resetReplaceFilter,
-  selectCalibrations,
+  resolveReconcile,
+  selectPendingReconciliations,
+  selectReconciliations,
   selectReplaceFilter,
   selectReplaces,
   transitionReplace,
   updateReplace,
-} from '@/stores/calibrationSlice';
+} from '@/stores/replaceSlice';
+import { selectCalibrations } from '@/stores/calibrationSlice';
 import {
   REPLACE_REASON_TEMPLATES,
   REPLACE_STATES,
@@ -52,6 +55,7 @@ import {
   type Replace,
   type ReplaceState,
 } from '@/types/replace';
+import { RECONCILE_SIDE_LABEL, RECONCILE_STATE_LABEL, RECONCILE_TYPE_LABEL, type Reconciliation } from '@/types/reconcile';
 import { daysUntilDue, type Instrument } from '@/types/instrument';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
 import { initDatabase } from '@/utils/db';
@@ -66,17 +70,21 @@ interface ReplaceFormValues {
   remark: string;
 }
 
-/** 仪器评定行：标定结论、待标定天数与更换状态 */
+/** 仪器评定行：当前序列号的标定结论、待标定天数与更换状态 */
 interface AssessmentRow {
   instrument: Instrument;
   stationCode: string;
   arrayId: string;
   arrayName: string;
+  /** 当前序列号自己的最近标定日期（旧序列号标定不计入） */
   lastDate: string;
   dueInDays: number;
   overdue: boolean;
   lastVerdict: string;
+  /** 当前序列号自己的标定次数（不含旧序列号） */
   calibrationCount: number;
+  /** 是否已完成当前序列号的第一次标定 */
+  firstCalibrationDone: boolean;
   replace: Replace | null;
 }
 
@@ -90,6 +98,8 @@ export default function ReplaceBoard() {
   const arrays = useAppSelector(selectArrays);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const reconciliations = useAppSelector(selectReconciliations);
+  const pendingReconciles = useAppSelector(selectPendingReconciliations);
   const filter = useAppSelector(selectReplaceFilter);
   const { histories } = useCalibHistory();
 
@@ -98,18 +108,30 @@ export default function ReplaceBoard() {
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<ReplaceFormValues>();
 
+  /** 正在编辑的更换单（已推进后锁定仪器与新序列号，只能改原因 / 备注 / 责任人） */
+  const editingReplace = useMemo(
+    () => (editingId ? replaces.find((row) => row.id === editingId) ?? null : null),
+    [editingId, replaces]
+  );
+  const serialLocked = !!editingReplace && editingReplace.state !== '待更换';
+
   useEffect(() => {
     if (arrays.length === 0) void initDatabase();
   }, [arrays.length]);
 
-  /** 仪器评定行：结合标定结论与更换记录 */
+  /** 仪器评定行：只看当前序列号自己的标定（旧序列号历次标定仍归旧序列号） */
   const rows = useMemo<AssessmentRow[]>(() => {
     return instruments
       .map((instrument) => {
         const station = stations.find((row) => row.id === instrument.stationId);
         const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
         const own = calibrations
-          .filter((row) => row.instrumentId === instrument.id)
+          .filter(
+            (row) =>
+              row.instrumentId === instrument.id &&
+              row.serialNo === instrument.serialNo &&
+              row.reconcileState === '已对齐'
+          )
           .sort((a, b) => b.date.localeCompare(a.date));
         const latest = own[0];
         const lastDate = latest ? latest.date : instrument.installDate;
@@ -128,6 +150,7 @@ export default function ReplaceBoard() {
           overdue: dueInDays < 0,
           lastVerdict: latest ? latest.responseVerdict : '待判定',
           calibrationCount: own.length,
+          firstCalibrationDone: own.length > 0,
           replace,
         };
       })
@@ -150,12 +173,24 @@ export default function ReplaceBoard() {
   const totals = useMemo(() => {
     const overdue = rows.filter((row) => row.overdue).length;
     const unqualified = rows.filter((row) => row.lastVerdict === '不合格').length;
+    const awaitingFirstCalibration = rows.filter(
+      (row) => row.instrument.state === '待标定' && !row.firstCalibrationDone
+    ).length;
     const pendingReplace = replaces.filter((row) => row.state === '待更换').length;
     const closedReplace = replaces.filter((row) => row.state === '已复核').length;
     const cycleRate =
       rows.length === 0 ? 0 : Number((((rows.length - overdue) / rows.length) * 100).toFixed(1));
-    return { instruments: rows.length, overdue, unqualified, pendingReplace, closedReplace, cycleRate };
-  }, [replaces, rows]);
+    return {
+      instruments: rows.length,
+      overdue,
+      unqualified,
+      awaitingFirstCalibration,
+      pendingReplace,
+      closedReplace,
+      suspended: pendingReconciles.length,
+      cycleRate,
+    };
+  }, [replaces, rows, pendingReconciles.length]);
 
   const replaceRows = useMemo(
     () =>
@@ -220,12 +255,14 @@ export default function ReplaceBoard() {
       };
       if (editingId) {
         await dispatch(updateReplace({ id: editingId, patch: payload })).unwrap();
-        message.success('更换记录已更新');
+        message.success('更换记录已更新（登记时的旧序列号快照不改动）');
       } else {
         await dispatch(createReplace(payload)).unwrap();
-        message.success('更换记录已登记，可在下方推进状态机');
+        message.success('更换记录已登记，可在下方推进状态机；新序列号将在推进到「已更换」时回写');
       }
       setModalOpen(false);
+    } catch (error) {
+      message.error(typeof error === 'string' ? error : '更换记录保存失败');
     } finally {
       setSubmitting(false);
     }
@@ -233,14 +270,45 @@ export default function ReplaceBoard() {
 
   const advance = async (row: Replace, next: ReplaceState) => {
     try {
-      await dispatch(transitionReplace({ id: row.id, next })).unwrap();
-      message.success(
-        next === '已更换'
-          ? '更换完成：已回写仪器序列号并置为在用，旧记录已归档'
-          : `更换记录状态已流转到「${next}」`
-      );
+      const result = await dispatch(
+        transitionReplace({ id: row.id, next, operator: row.operator })
+      ).unwrap();
+      if (result.kind === 'suspended') {
+        message.warning('两边数据对不上，已登记挂起待确认：更换单维持原状态，仪器档案未改动');
+      } else if (next === '已更换') {
+        message.success('更换完成：新序列号已回写并挂「待标定」，等该序列号自己的第一次标定再定状态');
+      } else {
+        message.success(`更换记录状态已流转到「${next}」`);
+      }
     } catch (error) {
       message.error(typeof error === 'string' ? error : '状态流转失败');
+    }
+  };
+
+  /** 处理挂起台账 */
+  const handleResolve = async (
+    item: Reconciliation,
+    decision: 'confirm' | 'cancel'
+  ) => {
+    const resolution = window.prompt(
+      decision === 'confirm'
+        ? '确认放行：请填写核对结论（标定侧档案序列号一致时将按结论补定状态；运维侧仅关闭挂起，需重新推进更换单）'
+        : '确认撤销：请填写作废原因（标定将标记作废，更换单不受影响）',
+      decision === 'confirm' ? '双方核对一致，放行' : '序列号录入有误，作废'
+    );
+    if (resolution === null) return;
+    try {
+      await dispatch(
+        resolveReconcile({
+          id: item.id,
+          decision,
+          resolution,
+          operator: item.operator,
+        })
+      ).unwrap();
+      message.success(decision === 'confirm' ? '挂起已确认放行' : '挂起已撤销');
+    } catch (error) {
+      message.error(typeof error === 'string' ? error : '挂起处理失败');
     }
   };
 
@@ -289,10 +357,31 @@ export default function ReplaceBoard() {
           suffix="台"
           tone={totals.unqualified > 0 ? 'warning' : 'success'}
         />
+        <StatBadge
+          label="换号待首标"
+          value={totals.awaitingFirstCalibration}
+          suffix="台"
+          tone={totals.awaitingFirstCalibration > 0 ? 'warning' : 'success'}
+        />
         <StatBadge label="按期标定率" value={totals.cycleRate} percent={totals.cycleRate} tone="success" />
         <StatBadge label="待更换" value={totals.pendingReplace} suffix="条" tone="warning" />
-        <StatBadge label="已复核" value={totals.closedReplace} suffix="条" tone="info" />
+        <StatBadge
+          label="挂起待确认"
+          value={totals.suspended}
+          suffix="条"
+          tone={totals.suspended > 0 ? 'danger' : 'success'}
+        />
       </div>
+
+      {totals.suspended > 0 ? (
+        <Alert
+          type="error"
+          showIcon
+          icon={<WarningFilled />}
+          message={`两册有 ${totals.suspended} 条对不上的记录已挂起等确认，仪器状态与序列号均未改动`}
+          description="请处理页底「挂起台账」：标定序列号对不上的，由计量站核对后放行或作废；新序列号冲突 / 档案已变的，运维班改单后重新推进。运维班认下的更换单与计量站的标定记录互不覆盖。"
+        />
+      ) : null}
 
       {overdueHistories.length > 0 ? (
         <Alert
@@ -371,12 +460,21 @@ export default function ReplaceBoard() {
               ),
             },
             {
-              title: '最近标定',
-              width: 130,
+              title: '当前序列号标定',
+              width: 150,
               render: (_: unknown, row: AssessmentRow) => (
                 <div>
-                  <div className="gb-mono">{row.lastDate}</div>
-                  <div className="gb-hint">{row.calibrationCount} 次记录</div>
+                  {row.calibrationCount > 0 ? (
+                    <>
+                      <div className="gb-mono">{row.lastDate}</div>
+                      <div className="gb-hint">本序列号 {row.calibrationCount} 次记录</div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="gb-danger gb-mono">尚无本序列号标定</div>
+                      <div className="gb-hint">等第一次标定定状态</div>
+                    </>
+                  )}
                 </div>
               ),
             },
@@ -463,12 +561,14 @@ export default function ReplaceBoard() {
             pagination={false}
             columns={[
               {
-                title: '仪器',
-                width: 200,
+                title: '仪器 / 序列号变更',
+                width: 240,
                 render: (_: unknown, item) => (
                   <div>
                     <div>{item.instrument?.model ?? '仪器已删除'}</div>
-                    <div className="gb-hint gb-mono">{item.row.newSerialNo || '未填新序列号'}</div>
+                    <div className="gb-hint gb-mono">
+                      {item.row.oldSerialNo || '—'} → {item.row.newSerialNo || '未填新序列号'}
+                    </div>
                   </div>
                 ),
               },
@@ -517,6 +617,9 @@ export default function ReplaceBoard() {
                         void dispatch(removeReplace(item.row.id))
                           .unwrap()
                           .then(() => message.success('更换记录已删除'))
+                          .catch((error: unknown) =>
+                            message.error(typeof error === 'string' ? error : '更换记录删除失败')
+                          )
                       }
                     >
                       <Button size="small" danger icon={<DeleteOutlined />}>
@@ -531,13 +634,126 @@ export default function ReplaceBoard() {
         )}
       </Card>
 
+      <Card
+        className="gb-panel"
+        size="small"
+        title={
+          <Space>
+            <WarningFilled style={{ color: totals.suspended > 0 ? '#c0392b' : '#52c41a' }} />
+            <span>两册挂起台账（{reconciliations.length} 条，待确认 {totals.suspended} 条）</span>
+          </Space>
+        }
+      >
+        {reconciliations.length === 0 ? (
+          <EmptyPanel
+            title="两册数据一致，没有挂起"
+            description="标定册与更换册的序列号对得上时仪器状态自动流转；一旦对不上，两边都不改档案，在这里登记并等确认。"
+            compact
+          />
+        ) : (
+          <Table
+            rowKey={(item) => item.id}
+            size="small"
+            className="gb-table-compact"
+            dataSource={[...reconciliations].sort((a, b) => b.updatedAt - a.updatedAt)}
+            pagination={false}
+            columns={[
+              {
+                title: '挂起类型 / 来源',
+                width: 180,
+                render: (_: unknown, item: Reconciliation) => (
+                  <div>
+                    <div>{RECONCILE_TYPE_LABEL[item.type]}</div>
+                    <div className="gb-hint">{RECONCILE_SIDE_LABEL[item.side]}</div>
+                  </div>
+                ),
+              },
+              {
+                title: '仪器 / 序列号',
+                width: 260,
+                render: (_: unknown, item: Reconciliation) => {
+                  const instrument = instruments.find((row) => row.id === item.instrumentId);
+                  return (
+                    <div>
+                      <div>{instrument ? `${instrument.model}` : '仪器已删除'}</div>
+                      <div className="gb-hint gb-mono">
+                        档案 {item.currentSerialNo || '—'} ⇄ 主张 {item.claimedSerialNo || '—'}
+                      </div>
+                    </div>
+                  );
+                },
+              },
+              { title: '挂起原因', dataIndex: 'reason', ellipsis: true },
+              {
+                title: '状态',
+                width: 110,
+                render: (_: unknown, item: Reconciliation) => (
+                  <Tag color={item.state === '待确认' ? 'red' : item.state === '已确认' ? 'green' : 'default'}>
+                    {RECONCILE_STATE_LABEL[item.state]}
+                  </Tag>
+                ),
+              },
+              {
+                title: '处理结论',
+                width: 180,
+                render: (_: unknown, item: Reconciliation) => (
+                  <span className="gb-hint">{item.resolution || '—'}</span>
+                ),
+              },
+              {
+                title: '操作',
+                width: 180,
+                render: (_: unknown, item: Reconciliation) =>
+                  item.state === '待确认' ? (
+                    <Space size={6}>
+                      <Popconfirm
+                        title="确认放行该挂起？"
+                        description={
+                          item.side === 'metrology'
+                            ? '档案序列号与该标定一致时将按结论补定仪器状态。'
+                            : '仅关闭挂起，运维班需修改更换单后重新推进，已认下的更换单不改动。'
+                        }
+                        okText="确认放行"
+                        cancelText="取消"
+                        onConfirm={() => void handleResolve(item, 'confirm')}
+                      >
+                        <Button size="small" type="primary">
+                          确认
+                        </Button>
+                      </Popconfirm>
+                      <Popconfirm
+                        title="撤销该挂起？"
+                        description={
+                          item.side === 'metrology'
+                            ? '该标定将标记为作废，不再参与评定与趋势。'
+                            : '关闭挂起，更换单维持原状态不动。'
+                        }
+                        okText="确认撤销"
+                        cancelText="取消"
+                        okButtonProps={{ danger: true }}
+                        onConfirm={() => void handleResolve(item, 'cancel')}
+                      >
+                        <Button size="small" danger>
+                          撤销
+                        </Button>
+                      </Popconfirm>
+                    </Space>
+                  ) : (
+                    <span className="gb-hint">已处理</span>
+                  ),
+              },
+            ]}
+          />
+        )}
+      </Card>
+
       <p className="gb-hint">
-        更换完成后点击「→ 已更换」，系统会把新序列号回写到仪器档案并置为在用；再流转到「已复核」即完成闭环。
-        前往
+        两册分治：运维班点击「→ 已更换」只把新序列号回写档案并挂「待标定」，不会直接置在用；
+        等该序列号自己的第一次标定在
         <Button type="link" size="small" onClick={() => navigate(ROUTES.calibrations)}>
           标定记录台
         </Button>
-        可查看历次灵敏度趋势。
+        录完，才由计量站按结论定状态。旧序列号的历次标定仍归旧序列号；两边对不上时先在上方挂起台账等确认。
       </p>
 
       <Modal
@@ -551,9 +767,19 @@ export default function ReplaceBoard() {
         destroyOnClose
       >
         <Form form={form} layout="vertical" preserve={false}>
-          <Form.Item name="instrumentId" label="被更换仪器" rules={[{ required: true, message: '请选择仪器' }]}>
+          <Form.Item
+            name="instrumentId"
+            label="被更换仪器"
+            rules={[{ required: true, message: '请选择仪器' }]}
+            extra={
+              editingReplace
+                ? `登记时档案旧序列号：${editingReplace.oldSerialNo || '—'}（快照不改动）`
+                : undefined
+            }
+          >
             <Select
               showSearch
+              disabled={!!editingId}
               optionFilterProp="label"
               options={instruments.map((instrument) => {
                 const station = stations.find((row) => row.id === instrument.stationId);
@@ -577,8 +803,13 @@ export default function ReplaceBoard() {
           </Space>
           <Row gutter={12}>
             <Col span={12}>
-              <Form.Item name="newSerialNo" label="新序列号" rules={[{ required: true, message: '请填写新序列号' }]}>
-                <Input maxLength={60} placeholder="如：CMG-3E-20250410-33" />
+              <Form.Item
+                name="newSerialNo"
+                label="新序列号（推进到「已更换」时回写，随后挂待标定）"
+                rules={[{ required: true, message: '请填写新序列号' }]}
+                extra={serialLocked ? '更换单已推进，新序列号锁定；如确需改号请新建更换单。' : undefined}
+              >
+                <Input maxLength={60} disabled={serialLocked} placeholder="如：CMG-3E-20250410-33" />
               </Form.Item>
             </Col>
             <Col span={12}>
@@ -589,8 +820,8 @@ export default function ReplaceBoard() {
           </Row>
           <Row gutter={12}>
             <Col span={12}>
-              <Form.Item name="state" label="状态" rules={[{ required: true }]}>
-                <Select options={REPLACE_STATES.map((state) => ({ label: state, value: state }))} />
+              <Form.Item name="state" label="状态（请用列表中的状态机按钮推进）" rules={[{ required: true }]}>
+                <Select disabled options={REPLACE_STATES.map((state) => ({ label: state, value: state }))} />
               </Form.Item>
             </Col>
             <Col span={12}>

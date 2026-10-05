@@ -3,11 +3,25 @@ export type ResponseVerdict = '合格' | '不合格' | '待判定';
 
 export const RESPONSE_VERDICTS: ResponseVerdict[] = ['合格', '不合格', '待判定'];
 
-/** 标定：同一仪器可叠加多次标定记录 */
+/** 标定记录与仪器档案的对账状态（序列号对不上先挂起） */
+export type CalibrationReconcileState = '已对齐' | '待确认' | '已撤销';
+
+export const CALIBRATION_RECONCILE_STATES: CalibrationReconcileState[] = [
+  '已对齐',
+  '待确认',
+  '已撤销',
+];
+
+/** 标定：同一序列号可叠加多次标定记录（旧序列号的历次标定仍归旧序列号） */
 export interface Calibration {
   id: string;
-  /** 被标定仪器 */
+  /** 被标定仪器档案 id（同一物理安装位更换后沿用，序列号则按次快照区分） */
   instrumentId: string;
+  /**
+   * 序列号快照：录入本次标定时仪器档案上的序列号。
+   * 仪器更换后旧序列号的历次标定仍挂在旧快照下，新序列号以本字段的首次标定定状态。
+   */
+  serialNo: string;
   /** 标定日期 */
   date: string;
   /** 灵敏度（V·s/m） */
@@ -16,6 +30,10 @@ export interface Calibration {
   selfNoise: number;
   /** 脉冲响应结论 */
   responseVerdict: ResponseVerdict;
+  /** 与仪器档案序列号是否对得上；对不上时挂起，不回写仪器状态 */
+  reconcileState: CalibrationReconcileState;
+  /** 关联挂起台账 id（待确认 / 已撤销时） */
+  reconciliationId: string;
   /** 标定人 */
   operator: string;
   /** 标定机构 */

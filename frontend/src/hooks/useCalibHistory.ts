@@ -62,8 +62,14 @@ export function useCalibHistory(): UseCalibHistoryResult {
       .map((instrument) => {
         const station = stations.find((item) => item.id === instrument.stationId);
         const array = station ? arrays.find((item) => item.id === station.arrayId) : undefined;
+        // 只看当前序列号自己的、已对齐的标定：旧序列号的历次标定仍归旧序列号，挂起记录不参与评定
         const rows = calibrations
-          .filter((calibration) => calibration.instrumentId === instrument.id)
+          .filter(
+            (calibration) =>
+              calibration.instrumentId === instrument.id &&
+              calibration.serialNo === instrument.serialNo &&
+              calibration.reconcileState === '已对齐'
+          )
           .sort((a, b) => b.date.localeCompare(a.date));
         const latest = rows.length > 0 ? rows[0] : null;
         const previous = rows.length > 1 ? rows[1] : null;

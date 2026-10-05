@@ -7,6 +7,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   App as AntdApp,
+  Alert,
   Button,
   Card,
   Col,
@@ -21,9 +22,10 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
-import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
+import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined, WarningFilled } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import FilterBar from '@/components/common/FilterBar';
 import type { FilterModel } from '@/types/filter';
@@ -43,12 +45,11 @@ import {
   selectCalibrations,
   updateCalibration,
 } from '@/stores/calibrationSlice';
+import { selectReconciliations } from '@/stores/replaceSlice';
 import {
   RESPONSE_VERDICTS,
   SELF_NOISE_LIMIT,
   SENSITIVITY_RANGE,
-  createEmptyCalibrationFilter,
-  judgeCalibration,
   sensitivityDelta,
   type Calibration,
   type ResponseVerdict,
@@ -59,6 +60,8 @@ import { initDatabase } from '@/utils/db';
 
 interface CalibrationFormValues {
   instrumentId: string;
+  /** 表单选择仪器时的序列号：提交时作为快照与档案比对，对不上会挂起 */
+  expectedSerialNo: string;
   date: dayjs.Dayjs | null;
   sensitivity: number;
   selfNoise: number;
@@ -73,7 +76,10 @@ interface CalibrationRow {
   row: Calibration;
   instrumentModel: string;
   instrumentType: string;
+  /** 标定记录自带的序列号快照（旧序列号的历次标定仍归旧序列号） */
   serialNo: string;
+  /** 档案当前序列号（与快照不一致时提示） */
+  currentSerialNo: string;
   stationCode: string;
   arrayName: string;
   arrayId: string;
@@ -90,12 +96,13 @@ export default function CalibrationBoard() {
   const instruments = useAppSelector(selectInstruments);
   const stations = useAppSelector(selectStations);
   const arrays = useAppSelector(selectArrays);
+  const reconciliations = useAppSelector(selectReconciliations);
   const filter = useAppSelector(selectCalibrationFilter);
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
-  const [trendInstrumentId, setTrendInstrumentId] = useState<string | null>(null);
+  const [trendKey, setTrendKey] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<CalibrationFormValues>();
 
@@ -132,13 +139,14 @@ export default function CalibrationBoard() {
     return map;
   }, [arrays, instruments, stations]);
 
-  /** 逐仪器排序后的标定序列，用于计算灵敏度变化 */
+  /** 逐「仪器 + 序列号快照」排序后的标定序列，用于计算灵敏度变化（旧序列号不并入新序列号） */
   const deltaIndex = useMemo(() => {
     const grouped = new Map<string, Calibration[]>();
     calibrations.forEach((row) => {
-      const list = grouped.get(row.instrumentId) ?? [];
+      const key = `${row.instrumentId} ${row.serialNo}`;
+      const list = grouped.get(key) ?? [];
       list.push(row);
-      grouped.set(row.instrumentId, list);
+      grouped.set(key, list);
     });
     const result = new Map<string, ReturnType<typeof sensitivityDelta>>();
     grouped.forEach((list) => {
@@ -158,7 +166,8 @@ export default function CalibrationBoard() {
           row,
           instrumentModel: info?.model ?? '仪器已删除',
           instrumentType: info?.type ?? '未知',
-          serialNo: info?.serialNo ?? '—',
+          serialNo: row.serialNo || info?.serialNo || '—',
+          currentSerialNo: info?.serialNo ?? '',
           stationCode: info?.stationCode ?? '—',
           arrayName: info?.arrayName ?? '—',
           arrayId: info?.arrayId ?? '',
@@ -180,17 +189,22 @@ export default function CalibrationBoard() {
   }, [calibrations, deltaIndex, filter, instrumentIndex]);
 
   const totals = useMemo(() => {
-    const unqualified = rows.filter((item) => item.row.responseVerdict === '不合格').length;
+    const alignedRows = rows.filter((item) => item.row.reconcileState === '已对齐');
+    const unqualified = alignedRows.filter((item) => item.row.responseVerdict === '不合格').length;
+    const suspended = rows.filter((item) => item.row.reconcileState === '待确认').length;
     const meanSensitivity =
-      rows.length === 0
+      alignedRows.length === 0
         ? 0
-        : round(rows.reduce((sum, item) => sum + item.row.sensitivity, 0) / rows.length, 1);
+        : round(alignedRows.reduce((sum, item) => sum + item.row.sensitivity, 0) / alignedRows.length, 1);
     const meanNoise =
-      rows.length === 0 ? 0 : round(rows.reduce((sum, item) => sum + item.row.selfNoise, 0) / rows.length, 2);
+      alignedRows.length === 0
+        ? 0
+        : round(alignedRows.reduce((sum, item) => sum + item.row.selfNoise, 0) / alignedRows.length, 2);
     return {
       count: rows.length,
       unqualified,
-      qualifyRate: rows.length === 0 ? 0 : round(((rows.length - unqualified) / rows.length) * 100, 1),
+      suspended,
+      qualifyRate: alignedRows.length === 0 ? 0 : round(((alignedRows.length - unqualified) / alignedRows.length) * 100, 1),
       meanSensitivity,
       meanNoise,
       operatorCount: new Set(rows.map((item) => item.row.operator)).size,
@@ -203,16 +217,37 @@ export default function CalibrationBoard() {
     instrumentTypes: filter.instrumentTypes,
   };
 
+  /** 可绘制趋势的「仪器 + 序列号」选项（旧序列号的历次标定单独成线） */
+  const trendOptions = useMemo(() => {
+    const seen = new Map<string, { instrumentId: string; serialNo: string; label: string }>();
+    calibrations
+      .filter((row) => row.reconcileState !== '已撤销')
+      .forEach((row) => {
+        const key = `${row.instrumentId} ${row.serialNo}`;
+        if (!seen.has(key)) {
+          const instrument = instruments.find((item) => item.id === row.instrumentId);
+          seen.set(key, {
+            instrumentId: row.instrumentId,
+            serialNo: row.serialNo,
+            label: `${instrument?.model ?? '未知仪器'}（${row.serialNo}）`,
+          });
+        }
+      });
+    return [...seen.entries()].map(([key, value]) => ({ key, ...value }));
+  }, [calibrations, instruments]);
+
   const trendRows = useMemo(() => {
-    const targetId = trendInstrumentId ?? rows[0]?.row.instrumentId ?? null;
-    if (!targetId) return { targetId: null as string | null, points: [] as Calibration[] };
+    const target = trendKey ?? `${rows[0]?.row.instrumentId ?? ''} ${rows[0]?.row.serialNo ?? ''}`.trim();
+    if (!target) return { targetKey: null as string | null, points: [] as Calibration[] };
+    const [instrumentId, ...serialParts] = target.split(' ');
+    const serialNo = serialParts.join(' ');
     return {
-      targetId,
+      targetKey: target,
       points: calibrations
-        .filter((row) => row.instrumentId === targetId)
+        .filter((row) => row.instrumentId === instrumentId && row.serialNo === serialNo && row.reconcileState !== '已撤销')
         .sort((a, b) => a.date.localeCompare(b.date)),
     };
-  }, [calibrations, rows, trendInstrumentId]);
+  }, [calibrations, rows, trendKey]);
 
   const openCreate = () => {
     setEditingId(null);
@@ -221,6 +256,7 @@ export default function CalibrationBoard() {
     const range = SENSITIVITY_RANGE[type];
     form.setFieldsValue({
       instrumentId: firstInstrument?.id ?? '',
+      expectedSerialNo: firstInstrument?.serialNo ?? '',
       date: dayjs(),
       sensitivity: round((range.min + range.max) / 2, 2),
       selfNoise: 1.5,
@@ -236,6 +272,7 @@ export default function CalibrationBoard() {
     setEditingId(row.id);
     form.setFieldsValue({
       instrumentId: row.instrumentId,
+      expectedSerialNo: row.serialNo,
       date: dayjs(row.date),
       sensitivity: row.sensitivity,
       selfNoise: row.selfNoise,
@@ -253,6 +290,7 @@ export default function CalibrationBoard() {
     try {
       const payload = {
         instrumentId: values.instrumentId,
+        expectedSerialNo: values.expectedSerialNo?.trim() ?? '',
         date: values.date ? values.date.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
         sensitivity: Number(values.sensitivity),
         selfNoise: Number(values.selfNoise),
@@ -262,15 +300,39 @@ export default function CalibrationBoard() {
         remark: values.remark?.trim() ?? '',
       };
       if (editingId) {
-        await dispatch(updateCalibration({ id: editingId, patch: payload })).unwrap();
-        message.success('标定记录已更新，结论已按灵敏度与自噪重新核定');
+        const result = await dispatch(updateCalibration({
+          id: editingId,
+          patch: {
+            date: payload.date,
+            sensitivity: payload.sensitivity,
+            selfNoise: payload.selfNoise,
+            responseVerdict: payload.responseVerdict,
+            operator: payload.operator,
+            agency: payload.agency,
+            remark: payload.remark,
+          },
+        })).unwrap();
+        if (result.kind === 'suspended') {
+          message.warning('该记录序列号已与档案对不上，已挂起待确认，仪器状态未改动');
+        } else {
+          message.success('标定记录已更新，结论已按灵敏度与自噪重新核定');
+        }
       } else {
-        await dispatch(createCalibration(payload)).unwrap();
-        const instrument = instruments.find((row) => row.id === payload.instrumentId);
-        const verdict = judgeCalibration(instrument?.type ?? '宽频带', payload.sensitivity, payload.selfNoise);
-        message.success(`标定记录已保存，自动初判为「${verdict}」`);
+        const result = await dispatch(createCalibration(payload)).unwrap();
+        if (result.kind === 'suspended') {
+          message.warning(
+            `序列号「${payload.expectedSerialNo}」与档案当前序列号对不上，标定已保存为挂起，请双方确认`
+          );
+        } else {
+          message.success(
+            `标定记录已保存，自动初判为「${result.row.responseVerdict}」` +
+              (result.firstCalibration ? '（该序列号第一次标定，仪器状态已据此定档）' : '')
+          );
+        }
       }
       setModalOpen(false);
+    } catch (error) {
+      message.error(typeof error === 'string' ? error : '标定保存失败');
     } finally {
       setSubmitting(false);
     }
@@ -368,11 +430,41 @@ export default function CalibrationBoard() {
           suffix="次"
           tone={totals.unqualified > 0 ? 'danger' : 'success'}
         />
+        <StatBadge
+          label="挂起待确认"
+          value={totals.suspended}
+          suffix="次"
+          tone={totals.suspended > 0 ? 'danger' : 'success'}
+        />
         <StatBadge label="合格率" value={totals.qualifyRate} percent={totals.qualifyRate} tone="success" />
         <StatBadge label="平均灵敏度" value={totals.meanSensitivity} suffix="V·s/m" tone="info" />
         <StatBadge label="平均自噪" value={totals.meanNoise} suffix="" tone="warning" />
         <StatBadge label="标定人" value={totals.operatorCount} suffix="人" tone="default" />
       </div>
+
+      {totals.suspended > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          icon={<WarningFilled />}
+          message={`有 ${totals.suspended} 条标定记录的序列号与仪器档案对不上，已挂起待确认，未回写仪器状态`}
+          description={
+            <Space direction="vertical" size={2}>
+              {reconciliations
+                .filter((item) => item.state === '待确认' && item.side === 'metrology')
+                .slice(0, 3)
+                .map((item) => (
+                  <span key={item.id} className="gb-hint">
+                    · {item.reason}
+                  </span>
+                ))}
+              <span className="gb-hint">
+                请在「合格评定与更换」页底部挂起台账核对：确认属实则放行（档案序列号一致时按结论补定状态），录错序列号则作废；计量站不会改动运维班已认下的更换单。
+              </span>
+            </Space>
+          }
+        />
+      ) : null}
 
       <FilterBar
         modelValue={filterModel}
@@ -427,14 +519,29 @@ export default function CalibrationBoard() {
           }}
           columns={[
             {
-              title: '仪器',
-              width: 200,
+              title: '仪器 / 序列号快照',
+              width: 240,
               render: (_: unknown, item: CalibrationRow) => (
                 <div>
                   <div>
                     {item.instrumentModel} <Tag>{item.instrumentType}</Tag>
                   </div>
-                  <div className="gb-hint gb-mono">{item.serialNo}</div>
+                  <Tooltip
+                    title={
+                      item.currentSerialNo && item.currentSerialNo !== item.serialNo
+                        ? `档案当前序列号：${item.currentSerialNo}（本条标定归属旧序列号 ${item.serialNo}）`
+                        : '与档案当前序列号一致'
+                    }
+                  >
+                    <span
+                      className={
+                        item.row.reconcileState === '待确认' ? 'gb-danger gb-mono' : 'gb-hint gb-mono'
+                      }
+                    >
+                      {item.serialNo}
+                      {item.row.reconcileState === '待确认' ? '（挂起）' : ''}
+                    </span>
+                  </Tooltip>
                 </div>
               ),
             },
@@ -462,7 +569,7 @@ export default function CalibrationBoard() {
                       {item.delta.absolute}（{item.delta.percent}%）
                     </div>
                   ) : (
-                    <div className="gb-hint">首次标定</div>
+                    <div className="gb-hint">该序列号首次标定</div>
                   )}
                 </div>
               ),
@@ -478,15 +585,26 @@ export default function CalibrationBoard() {
               ),
             },
             {
-              title: '响应结论',
-              width: 190,
+              title: '响应结论 / 对账',
+              width: 200,
               render: (_: unknown, item: CalibrationRow) => (
-                <QualifyTag
-                  verdict={item.row.responseVerdict}
-                  sensitivity={item.row.sensitivity}
-                  selfNoise={item.row.selfNoise}
-                  size="small"
-                />
+                <Space size={4} direction="vertical" style={{ rowGap: 2 }}>
+                  <QualifyTag
+                    verdict={item.row.responseVerdict}
+                    sensitivity={item.row.sensitivity}
+                    selfNoise={item.row.selfNoise}
+                    size="small"
+                  />
+                  {item.row.reconcileState === '待确认' ? (
+                    <Tag color="red" style={{ marginInlineEnd: 0 }}>
+                      序列号待确认
+                    </Tag>
+                  ) : item.row.reconcileState === '已撤销' ? (
+                    <Tag color="default" style={{ marginInlineEnd: 0 }}>
+                      已作废
+                    </Tag>
+                  ) : null}
+                </Space>
               ),
             },
             {
@@ -505,7 +623,10 @@ export default function CalibrationBoard() {
               width: 190,
               render: (_: unknown, item: CalibrationRow) => (
                 <Space size={6}>
-                  <Button size="small" onClick={() => setTrendInstrumentId(item.row.instrumentId)}>
+                  <Button
+                    size="small"
+                    onClick={() => setTrendKey(`${item.row.instrumentId} ${item.row.serialNo}`)}
+                  >
                     趋势
                   </Button>
                   <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(item.row)}>
@@ -521,6 +642,9 @@ export default function CalibrationBoard() {
                       void dispatch(removeCalibration(item.row.id))
                         .unwrap()
                         .then(() => message.success('标定记录已删除'))
+                        .catch((error: unknown) =>
+                          message.error(typeof error === 'string' ? error : '标定记录删除失败')
+                        )
                     }
                   >
                     <Button size="small" danger icon={<DeleteOutlined />}>
@@ -540,19 +664,19 @@ export default function CalibrationBoard() {
         title="灵敏度趋势"
         extra={
           <Select
-            style={{ width: 260 }}
-            placeholder="选择仪器"
-            value={trendRows.targetId ?? undefined}
-            onChange={(value) => setTrendInstrumentId(value)}
-            options={instruments.map((instrument) => ({
-              label: `${instrument.model}（${instrument.serialNo}）`,
-              value: instrument.id,
+            style={{ width: 300 }}
+            placeholder="选择仪器 / 序列号"
+            value={trendRows.targetKey ?? undefined}
+            onChange={(value) => setTrendKey(value)}
+            options={trendOptions.map((option) => ({
+              label: option.label,
+              value: option.key,
             }))}
           />
         }
       >
         {trendChart.dots.length === 0 ? (
-          <EmptyPanel title="暂无可绘制的趋势" description="该仪器还没有标定记录。" compact />
+          <EmptyPanel title="暂无可绘制的趋势" description="该序列号还没有标定记录。" compact />
         ) : (
           <>
             <svg viewBox="0 0 380 220" className="gb-chart">
@@ -605,6 +729,7 @@ export default function CalibrationBoard() {
             <Select
               showSearch
               optionFilterProp="label"
+              disabled={!!editingId}
               options={instruments.map((instrument) => {
                 const info = instrumentIndex.get(instrument.id);
                 return {
@@ -616,8 +741,18 @@ export default function CalibrationBoard() {
                 const instrument = instruments.find((row) => row.id === value);
                 const range = SENSITIVITY_RANGE[instrument?.type ?? '宽频带'];
                 form.setFieldValue('sensitivity', round((range.min + range.max) / 2, 2));
+                // 选定仪器即取档案当前序列号作为本次标定的快照依据；若实物序列号不同，先改下面的序列号
+                form.setFieldValue('expectedSerialNo', instrument?.serialNo ?? '');
               }}
             />
+          </Form.Item>
+          <Form.Item
+            name="expectedSerialNo"
+            label="本次标定的仪器序列号（序列号快照）"
+            rules={[{ required: true, message: '请填写仪器序列号' }]}
+            extra="以实物铭牌为准。若与档案当前序列号不一致，本次标定将挂起待确认，不会改动仪器状态与更换单。"
+          >
+            <Input maxLength={60} placeholder="如：CMG-3E-20210418-01" disabled={!!editingId} />
           </Form.Item>
           <Row gutter={12}>
             <Col span={12}>

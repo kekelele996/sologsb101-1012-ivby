@@ -27,7 +27,8 @@ import EmptyPanel from '@/components/common/EmptyPanel';
 import { useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
 import { selectInstruments } from '@/stores/instrumentSlice';
-import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectCalibrations } from '@/stores/calibrationSlice';
+import { selectReconciliations, selectReplaces } from '@/stores/replaceSlice';
 import {
   DB_NAME,
   DB_VERSION,
@@ -52,7 +53,14 @@ import {
 } from '@/utils/export';
 import { bearingDeg, round, stationDistances, toLocalPlane, planeViewBox } from '@/utils/geo';
 
-const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0 };
+const EMPTY_COUNTS: CountMap = {
+  arrays: 0,
+  stations: 0,
+  instruments: 0,
+  calibrations: 0,
+  replaces: 0,
+  reconciliations: 0,
+};
 
 export default function GeometryView() {
   const { message } = AntdApp.useApp();
@@ -62,6 +70,7 @@ export default function GeometryView() {
   const instruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const reconciliations = useAppSelector(selectReconciliations);
 
   const [selectedArrayId, setSelectedArrayId] = useState<string | null>(null);
   const [counts, setCounts] = useState<CountMap>(EMPTY_COUNTS);
@@ -86,7 +95,7 @@ export default function GeometryView() {
   useEffect(() => {
     void refresh();
     // 数据变化后刷新统计
-  }, [arrays, stations, instruments, calibrations, replaces]);
+  }, [arrays, stations, instruments, calibrations, replaces, reconciliations]);
 
   const activeArrayId = selectedArrayId ?? arrays[0]?.id ?? null;
   const activeArray = arrays.find((row) => row.id === activeArrayId) ?? null;
@@ -106,9 +115,10 @@ export default function GeometryView() {
       instruments,
       calibrations,
       replaces,
+      reconciliations,
     };
     return buildArraySummaries(payload);
-  }, [arrays, calibrations, instruments, replaces, stations]);
+  }, [arrays, calibrations, instruments, reconciliations, replaces, stations]);
 
   const activeSummary = summaries.find((row) => row.arrayId === activeArrayId) ?? null;
 
@@ -215,7 +225,7 @@ export default function GeometryView() {
 
   const handleReset = async (): Promise<void> => {
     const confirmed = window.confirm(
-      '将清空全部本地数据并重新播种演示数据（台阵、台站、仪器、标定、更换）。确认继续？'
+      '将清空全部本地数据并重新播种演示数据（台阵、台站、仪器、标定、更换、挂起台账）。确认继续？'
     );
     if (!confirmed) return;
     setBusy(true);
@@ -284,6 +294,12 @@ export default function GeometryView() {
         <StatBadge label="仪器" value={counts.instruments} suffix="台" tone="default" />
         <StatBadge label="标定记录" value={counts.calibrations} suffix="次" tone="success" />
         <StatBadge label="更换记录" value={counts.replaces} suffix="条" tone="warning" />
+        <StatBadge
+          label="挂起台账"
+          value={counts.reconciliations}
+          suffix="条"
+          tone={counts.reconciliations > 0 ? 'danger' : 'success'}
+        />
       </div>
 
       {!activeArray || !activeSummary ? (
@@ -504,14 +520,14 @@ export default function GeometryView() {
             <Descriptions.Item label="浏览器记录版本">v{stampedVersion}</Descriptions.Item>
             <Descriptions.Item label="台阵 / 台站">{counts.arrays} / {counts.stations}</Descriptions.Item>
             <Descriptions.Item label="仪器 / 标定">{counts.instruments} / {counts.calibrations}</Descriptions.Item>
-            <Descriptions.Item label="更换记录">{counts.replaces}</Descriptions.Item>
+            <Descriptions.Item label="更换 / 挂起">{counts.replaces} / {counts.reconciliations}</Descriptions.Item>
             <Descriptions.Item label="最近备份时间" span={3}>
               {lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份'}
             </Descriptions.Item>
           </Descriptions>
           <p className="gb-hint">
             数据仅保存在当前浏览器 IndexedDB（{DB_NAME}）中，换浏览器或清空站点数据后不会自动跟随，请通过 JSON
-            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces 五张表。
+            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces / reconciliations 六张表。
           </p>
         </Space>
       </Card>

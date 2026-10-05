@@ -77,15 +77,20 @@ export const updateInstrument = createAsyncThunk(
   }
 );
 
-/** 删除仪器：级联删除标定与更换记录 */
+/** 删除仪器：级联删除标定、更换记录与挂起台账 */
 export const removeInstrument = createAsyncThunk(
   'instrument/removeInstrument',
   async (instrumentId: string) => {
-    await db.transaction('rw', [db.instruments, db.calibrations, db.replaces], async () => {
-      await db.calibrations.where('instrumentId').equals(instrumentId).delete();
-      await db.replaces.where('instrumentId').equals(instrumentId).delete();
-      await db.instruments.delete(instrumentId);
-    });
+    await db.transaction(
+      'rw',
+      [db.instruments, db.calibrations, db.replaces, db.reconciliations],
+      async () => {
+        await db.calibrations.where('instrumentId').equals(instrumentId).delete();
+        await db.replaces.where('instrumentId').equals(instrumentId).delete();
+        await db.reconciliations.where('instrumentId').equals(instrumentId).delete();
+        await db.instruments.delete(instrumentId);
+      }
+    );
     return instrumentId;
   }
 );
@@ -102,19 +107,6 @@ export const bulkSetInstrumentState = createAsyncThunk(
         row.state = payload.state;
         row.updatedAt = now;
       });
-    return payload;
-  }
-);
-
-/** 更换完成后回写仪器序列号并置为在用 */
-export const applySerialReplace = createAsyncThunk(
-  'instrument/applySerialReplace',
-  async (payload: { instrumentId: string; newSerialNo: string }) => {
-    await db.instruments.update(payload.instrumentId, {
-      serialNo: payload.newSerialNo,
-      state: '在用',
-      updatedAt: Date.now(),
-    } as never);
     return payload;
   }
 );
